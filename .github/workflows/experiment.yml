@@ -502,17 +502,17 @@ jobs:
               id: zap
               shell: bash
               run: |
-                  set -euo pipefail
+                  set -Eeuo pipefail
 
                   EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
                   ZAP_API="$ZAP_API_URL"
                   PLAN_PATH="/zap/wrk/$DAST_PLAN"
                   DAST_ZAP_API_KEY=$(openssl rand -hex 32)
 
-                  # Compartilha a chave temporária com os próximos steps.
+                  mkdir -p "$EVIDENCE_DIR"
                   echo "DAST_ZAP_API_KEY=$DAST_ZAP_API_KEY" >> "$GITHUB_ENV"
 
-                  # O container permanece ativo até Collect DAST evidence.
+                  # Inicia o ZAP em daemon e mantém o container ativo.
                   docker run -d \
                     --name dast-zap \
                     --publish 8080:8080 \
@@ -526,63 +526,126 @@ jobs:
                       -config "api.addrs.addr.name=.*" \
                       -config "api.addrs.addr.regex=true"
 
+                  # Aguarda a inicialização da API.
                   ready=false
-                  for attempt in $(seq 1 60); do
-                    if curl -fsS -G \
-                      "$ZAP_API/JSON/core/view/version/" \
+
+                  for attempt in $(seq 1 90); do
+                    if ! docker inspect -f '{{.State.Running}}' dast-zap 2>/dev/null \
+                      | grep -qx true; then
+                      echo "::error::O container OWASP ZAP foi encerrado."
+                      docker logs dast-zap --tail 150 || true
+                      exit 1
+                    fi
+
+                    if curl -fsS --connect-timeout 3 --max-time 5 \
+                      -G "$ZAP_API/JSON/core/view/version/" \
                       --data-urlencode "apikey=$DAST_ZAP_API_KEY" \
-                      -o "$EVIDENCE_DIR/zap-version.json"; then
+                      -o "$EVIDENCE_DIR/zap-version.json" \
+                      2>/dev/null; then
                       ready=true
                       break
                     fi
+
                     sleep 2
                   done
 
                   if [ "$ready" != "true" ]; then
-                    echo "::error::OWASP ZAP não ficou disponível."
+                    echo "::error::OWASP ZAP não ficou disponível após 180 segundos."
+                    docker logs dast-zap --tail 150 \
+                      > "$EVIDENCE_DIR/zap-startup-error.log" 2>&1 || true
+                    cat "$EVIDENCE_DIR/zap-startup-error.log"
                     exit 1
                   fi
+
+                  jq -e '.version' "$EVIDENCE_DIR/zap-version.json" >/dev/null
 
                   echo "zap_version=$(jq -r '.version' "$EVIDENCE_DIR/zap-version.json")" \
                     >> "$EVIDENCE_DIR/metadata.txt"
 
-                  response=$(curl -fsS -G \
+                  # Executa o Automation Framework.
+                  if ! curl -fsS --connect-timeout 5 --max-time 30 -G \
                     "$ZAP_API/JSON/automation/action/runPlan/" \
                     --data-urlencode "apikey=$DAST_ZAP_API_KEY" \
-                    --data-urlencode "filePath=$PLAN_PATH")
+                    --data-urlencode "filePath=$PLAN_PATH" \
+                    -o "$EVIDENCE_DIR/zap-plan-start.json"; then
+                    echo "::error::Não foi possível iniciar o plano DAST."
+                    docker logs dast-zap --tail 150 || true
+                    exit 1
+                  fi
 
-                  echo "$response" > "$EVIDENCE_DIR/zap-plan-start.json"
-                  plan_id=$(echo "$response" | jq -r '.planId // empty')
+                  plan_id=$(jq -r '.planId // empty' \
+                    "$EVIDENCE_DIR/zap-plan-start.json")
 
                   if [ -z "$plan_id" ]; then
-                    echo "::error::O ZAP não retornou um identificador do plano."
+                    echo "::error::O ZAP não retornou o identificador do plano."
+                    cat "$EVIDENCE_DIR/zap-plan-start.json"
                     exit 1
                   fi
 
                   echo "zap_plan_id=$plan_id" >> "$EVIDENCE_DIR/metadata.txt"
+
+                  # Acompanha o plano sem confundir falha de consulta com conclusão.
                   completed=false
 
-                  for attempt in $(seq 1 900); do
-                    curl -fsS -G \
+                  for attempt in $(seq 1 1200); do
+                    if ! docker inspect -f '{{.State.Running}}' dast-zap 2>/dev/null \
+                      | grep -qx true; then
+                      echo "::error::O container ZAP encerrou durante a análise."
+                      docker logs dast-zap --tail 150 || true
+                      exit 1
+                    fi
+
+                    if curl -fsS --connect-timeout 5 --max-time 15 -G \
                       "$ZAP_API/JSON/automation/view/planProgress/" \
                       --data-urlencode "apikey=$DAST_ZAP_API_KEY" \
                       --data-urlencode "planId=$plan_id" \
-                      -o "$EVIDENCE_DIR/zap-plan-progress.json"
+                      -o "$EVIDENCE_DIR/zap-plan-progress.json" \
+                      2>/dev/null; then
 
-                    if jq -e '.. | objects | select(has("status")) | .status == "COMPLETED"' \
-                      "$EVIDENCE_DIR/zap-plan-progress.json" >/dev/null 2>&1; then
-                      completed=true
-                      break
+                      # Registra o progresso periodicamente para diagnóstico.
+                      if [ "$attempt" -eq 1 ] || [ $((attempt % 15)) -eq 0 ]; then
+                        echo "Consulta de progresso: $attempt"
+                        jq '.' "$EVIDENCE_DIR/zap-plan-progress.json" || true
+                      fi
+
+                      # Reconhece estados explícitos de conclusão ou falha.
+                      if jq -e '
+                        [
+                          .. | objects |
+                          select(has("status")) |
+                          (.status | tostring | ascii_upcase)
+                        ] | any(. == "COMPLETED" or . == "FINISHED")
+                      ' "$EVIDENCE_DIR/zap-plan-progress.json" >/dev/null 2>&1; then
+                        completed=true
+                        break
+                      fi
+
+                      if jq -e '
+                        [
+                          .. | objects |
+                          select(has("status")) |
+                          (.status | tostring | ascii_upcase)
+                        ] | any(. == "FAILED" or . == "ERROR")
+                      ' "$EVIDENCE_DIR/zap-plan-progress.json" >/dev/null 2>&1; then
+                        echo "::error::O Automation Framework informou falha."
+                        cat "$EVIDENCE_DIR/zap-plan-progress.json"
+                        exit 1
+                      fi
                     fi
+
                     sleep 2
                   done
 
                   if [ "$completed" != "true" ]; then
-                    echo "::error::O plano DAST não foi confirmado como concluído."
+                    echo "::error::Tempo limite aguardando conclusão do plano DAST."
+                    docker logs dast-zap --tail 200 \
+                      > "$EVIDENCE_DIR/zap-plan-error.log" 2>&1 || true
+                    cat "$EVIDENCE_DIR/zap-plan-error.log"
                     exit 1
                   fi
 
                   echo "zap_plan_completed=true" >> "$EVIDENCE_DIR/metadata.txt"
+                  echo "Automation Framework concluído."
 
             - name: Run behavioral DAST tests
               id: behavioral_dast
