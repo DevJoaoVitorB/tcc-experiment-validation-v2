@@ -678,16 +678,28 @@ jobs:
                       traditional-html) filename=zap-report.html ;;
                     esac
 
-                    response=$(curl -fsS -G \
+                    response_file="$EVIDENCE_DIR/zap-report-response.json"
+
+                    http_code=$(curl -sS -G \
+                      -o "$response_file" \
+                      -w "%{http_code}" \
                       "$ZAP_API/JSON/reports/action/generate/" \
                       --data-urlencode "apikey=$DAST_ZAP_API_KEY" \
                       --data-urlencode "title=DAST - Authentication API" \
-                      --data-urlencode "template=$template" \
-                      --data-urlencode "description=Alertas do ZAP e testes comportamentais da API de autenticação." \
-                      --data-urlencode "sites=$DAST_BASE_URL" \
-                      --data-urlencode "reportFileName=$filename" \
+                      --data-urlencode "template=traditional-json" \
+                      --data-urlencode "description=Relatório DAST da API de autenticação." \
+                      --data-urlencode "sites=$ZAP_BASE_URL" \
+                      --data-urlencode "reportFileName=zap-report.json" \
                       --data-urlencode "reportDir=/zap/out" \
                       --data-urlencode "display=false")
+
+                    echo "HTTP status: $http_code"
+                    cat "$response_file"
+
+                    if [ "$http_code" != "200" ]; then
+                      echo "::error::Falha na geração do relatório JSON do ZAP."
+                      exit 1
+                    fi
 
                     echo "$response" >> "$EVIDENCE_DIR/report-generation.jsonl"
 
