@@ -443,6 +443,10 @@ jobs:
                   # Registra a configuração utilizada.
                   cp "$DAST_PLAN" "$EVIDENCE_DIR/dast.rules.yml"
 
+                  # Prepara as permissões para gravação dos relatórios pelo container.
+                  mkdir -p "$EVIDENCE_DIR"
+                  chmod 0777 "$EVIDENCE_DIR"
+
                   # Gera uma chave exclusiva para a API do ZAP.
                   KEY=$(openssl rand -hex 32)
 
@@ -564,8 +568,7 @@ jobs:
                   ' "$EVIDENCE_DIR/zap-plan-progress.json" \
                     > "$EVIDENCE_DIR/zap-plan-errors.log"
 
-                  # Os relatórios são gerados pelos jobs nativos
-                  # report definidos no dast.rules.yml.
+                  # Verifica os relatórios gerados pelos jobs nativos.
                   REPORTS_OK=true
 
                   if [ ! -s "$EVIDENCE_DIR/zap-report.json" ]; then
@@ -590,8 +593,7 @@ jobs:
                     echo "zap_reports_generated=$REPORTS_OK"
                   } >> "$EVIDENCE_DIR/metadata.txt"
 
-                  # Impede que uma análise incompleta seja
-                  # considerada válida no experimento.
+                  # Impede que uma análise incompleta seja considerada válida.
                   if [ "$PLAN_ERRORS" -gt 0 ]; then
                     echo "::error::O plano ZAP apresentou erros."
                     exit 1
