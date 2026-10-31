@@ -710,7 +710,8 @@ jobs:
                       --data-urlencode "display=false")
 
                     echo "HTTP status ($filename): $http_code"
-if [ "$http_code" != "200" ]; then
+
+                    if [ "$http_code" != "200" ]; then
                       echo "::error::Falha na geração de $filename."
                       cat "$response_file"
                       exit 1
