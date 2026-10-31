@@ -705,14 +705,12 @@ jobs:
                       --data-urlencode "title=DAST - Authentication API" \
                       --data-urlencode "template=$template" \
                       --data-urlencode "description=Alertas do ZAP e testes comportamentais da API de autenticação." \
-                      --data-urlencode "sites=$ZAP_BASE_URL" \
                       --data-urlencode "reportFileName=$filename" \
                       --data-urlencode "reportDir=/zap/out" \
                       --data-urlencode "display=false")
 
                     echo "HTTP status ($filename): $http_code"
-
-                    if [ "$http_code" != "200" ]; then
+if [ "$http_code" != "200" ]; then
                       echo "::error::Falha na geração de $filename."
                       cat "$response_file"
                       exit 1
