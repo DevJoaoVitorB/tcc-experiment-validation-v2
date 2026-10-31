@@ -24,27 +24,27 @@ env:
     contexts:
         - name: authentication-api
           urls:
-              - http://127.0.0.1:3000
+              - http://host.docker.internal:3000
           includePaths:
               - 'http://127\.0\.0\.1:3000/.*'
 
     vars:
-        baseUrl: http://127.0.0.1:3000
+        baseUrl: http://host.docker.internal:3000
 
 jobs:
     # Confirma que a API está disponível antes da análise.
     - type: requestor
       requests:
-          - url: http://127.0.0.1:3000/health
+          - url: http://host.docker.internal:3000/health
             name: Verificar disponibilidade da API
             method: GET
 
     # Importa os endpoints documentados na especificação OpenAPI.
     - type: openapi
       parameters:
-          apiUrl: http://127.0.0.1:3000/openapi.json
+          apiUrl: http://host.docker.internal:3000/openapi.json
           context: authentication-api
-          targetUrl: http://127.0.0.1:3000
+          targetUrl: http://host.docker.internal:3000
 
     # Configura os limites de execução do Active Scan.
     - type: activeScan-config
@@ -58,7 +58,7 @@ jobs:
     - type: activeScan
       parameters:
           context: authentication-api
-          url: http://127.0.0.1:3000
+          url: http://host.docker.internal:3000
           threadPerHost: 2
           maxAlertsPerRule: 20
       policyDefinition:

@@ -347,7 +347,7 @@ jobs:
         name: DAST - Grupo ${{ inputs.experiment_group }}
         runs-on: ubuntu-24.04
         needs: validate
-        timeout-minutes: 30
+        timeout-minutes: 45
 
         env:
             JWT_ACCESS_SECRET: 'dast-test-access-secret-CHANGE-ME-123456789'
@@ -515,6 +515,7 @@ jobs:
                   # Inicia o ZAP em daemon e mantém o container ativo.
                   docker run -d \
                     --name dast-zap \
+                    --add-host=host.docker.internal:host-gateway \
                     --publish 8080:8080 \
                     --volume "$GITHUB_WORKSPACE:/zap/wrk:ro" \
                     --volume "$EVIDENCE_DIR:/zap/out:rw" \
@@ -584,10 +585,11 @@ jobs:
 
                   echo "zap_plan_id=$plan_id" >> "$EVIDENCE_DIR/metadata.txt"
 
-                  # Acompanha o plano sem confundir falha de consulta com conclusão.
+                  # Acompanha a execução pelo campo "finished" retornado pelo ZAP.
+                  # O progresso não utiliza status COMPLETED/FAILED.
                   completed=false
 
-                  for attempt in $(seq 1 1200); do
+                  for attempt in $(seq 1 900); do
                     if ! docker inspect -f '{{.State.Running}}' dast-zap 2>/dev/null \
                       | grep -qx true; then
                       echo "::error::O container ZAP encerrou durante a análise."
@@ -602,34 +604,25 @@ jobs:
                       -o "$EVIDENCE_DIR/zap-plan-progress.json" \
                       2>/dev/null; then
 
-                      # Registra o progresso periodicamente para diagnóstico.
                       if [ "$attempt" -eq 1 ] || [ $((attempt % 15)) -eq 0 ]; then
                         echo "Consulta de progresso: $attempt"
                         jq '.' "$EVIDENCE_DIR/zap-plan-progress.json" || true
                       fi
 
-                      # Reconhece estados explícitos de conclusão ou falha.
-                      if jq -e '
-                        [
-                          .. | objects |
-                          select(has("status")) |
-                          (.status | tostring | ascii_upcase)
-                        ] | any(. == "COMPLETED" or . == "FINISHED")
-                      ' "$EVIDENCE_DIR/zap-plan-progress.json" >/dev/null 2>&1; then
+                      finished=$(jq -r '.finished // empty' \
+                        "$EVIDENCE_DIR/zap-plan-progress.json")
+
+                      if [ -n "$finished" ]; then
+                        if jq -e '(.error // []) | length > 0' \
+                          "$EVIDENCE_DIR/zap-plan-progress.json" >/dev/null; then
+                          echo "::error::O Automation Framework terminou com erros."
+                          jq '{warn, error, info, started, finished}' \
+                            "$EVIDENCE_DIR/zap-plan-progress.json"
+                          exit 1
+                        fi
+
                         completed=true
                         break
-                      fi
-
-                      if jq -e '
-                        [
-                          .. | objects |
-                          select(has("status")) |
-                          (.status | tostring | ascii_upcase)
-                        ] | any(. == "FAILED" or . == "ERROR")
-                      ' "$EVIDENCE_DIR/zap-plan-progress.json" >/dev/null 2>&1; then
-                        echo "::error::O Automation Framework informou falha."
-                        cat "$EVIDENCE_DIR/zap-plan-progress.json"
-                        exit 1
                       fi
                     fi
 
