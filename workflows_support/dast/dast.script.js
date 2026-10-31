@@ -1,715 +1,244 @@
-/*
- * Executor independente de verificações comportamentais DAST.
+/**
+ * Suíte complementar ao OWASP ZAP para RS01, RS02, RS04, RS05, RS06 e RS07.
+ * RS03 (dependências) pertence ao SCA e não é avaliada neste script.
+ * Descobre operações e schemas exclusivamente pelo OpenAPI em /openapi.json.
+ * Não presume nomes de rotas, operationId ou biblioteca de documentação.
  *
- * Verificações:
- * 1. Acesso sem autenticação.
- * 2. Isolamento entre identidades.
- * 3. Confusão entre access token e refresh token.
- * 4. Rotação e invalidação de refresh token após logout.
- * 5. Exposição de credenciais nas respostas.
- *
- * Execução: Node.js 22.
- *
- * Variáveis:
- * DAST_BASE_URL       Endereço da API acessível pelo runner.
- * ZAP_BASE_URL        Endereço da API conforme registrado no ZAP.
- * ZAP_API_URL         API do OWASP ZAP.
- * DAST_ZAP_API_KEY    Chave da API do ZAP.
- * DAST_OUTPUT_DIR     Diretório das evidências.
- * ZAP_PROXY_URL       Proxy HTTP do ZAP.
+ * Node.js 20+ (ESM). Saída: DAST_OUTPUT_DIR/dast-tests.json
  */
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 
-'use strict';
+const BASE = (process.env.DAST_BASE_URL || 'http://127.0.0.1:3000').replace(/\/$/, '');
+const OUT = process.env.DAST_OUTPUT_DIR || 'evidence/dast';
+const OPENAPI = `${BASE}/openapi.json`;
+const METHODS = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options'];
+const results = [];
+const MAX_OPERATIONS = 60;
+const MAX_BODY_TESTS = 25;
+const random = () => crypto.randomUUID();
+const is2xx = n => n >= 200 && n < 300;
+const json = value => JSON.stringify(value);
 
-const fs = require('node:fs');
-const path = require('node:path');
-const crypto = require('node:crypto');
-const { execFileSync } = require('node:child_process');
-
-const BASE = (process.env.DAST_BASE_URL || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-const ZAP_BASE = (process.env.ZAP_BASE_URL || BASE).replace(/\/+$/, '');
-const ZAP = (process.env.ZAP_API_URL || 'http://127.0.0.1:8080').replace(/\/+$/, '');
-const API_KEY = process.env.DAST_ZAP_API_KEY || '';
-const OUTPUT = path.join(process.env.DAST_OUTPUT_DIR || 'evidence/dast', 'dast-tests.json');
-const PROXY = (process.env.ZAP_PROXY_URL || 'http://127.0.0.1:8080').replace(/\/+$/, '');
-
-const tests = [];
-const errors = [];
-let alertErrors = 0;
-
-const random = () => crypto.randomUUID().replace(/-/g, '');
-const is2xx = status => status >= 200 && status < 300;
-const isRejected = status => [400, 401, 403, 404, 405, 409, 415, 422].includes(status);
-
-function pause(ms) {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+function add(rs, id, outcome, detail, extra = {}) {
+  results.push({ requirement: rs, id, outcome, detail, ...extra });
+  console.log(`[DAST][${rs}] ${id}: ${outcome} — ${detail}`);
 }
 
-function parseJson(text) {
-    try {
-        return JSON.parse(text);
-    } catch {
-        return null;
-    }
+function curl(method, url, body) {
+  const args = ['--silent', '--show-error', '--max-time', '20', '--request', method,
+    '--header', 'Accept: application/json', '--write-out', '\n__STATUS__:%{http_code}', url];
+  if (body !== undefined) args.splice(args.length - 1, 0,
+    '--header', 'Content-Type: application/json', '--data-binary', json(body));
+  const raw = execFileSync('curl', args, { encoding: 'utf8', timeout: 25000, maxBuffer: 5 * 1024 * 1024 });
+  const marker = '\n__STATUS__:';
+  const at = raw.lastIndexOf(marker);
+  if (at < 0) throw new Error(`Resposta HTTP sem status: ${method} ${url}`);
+  const text = raw.slice(0, at);
+  const status = Number(raw.slice(at + marker.length).trim());
+  if (!Number.isInteger(status) || status <= 0) throw new Error(`Status HTTP inválido: ${method} ${url}`);
+  return { status, text, data: (() => { try { return JSON.parse(text); } catch { return null; } })() };
 }
 
-function tokenFrom(data, names) {
-    if (!data || typeof data !== 'object') return null;
-
-    for (const name of names) {
-        if (typeof data[name] === 'string' && data[name]) {
-            return data[name];
-        }
-    }
-
-    return tokenFrom(data.data, names) || tokenFrom(data.tokens, names);
+function resolvePath(template) {
+  return template.replace(/\{([^}]+)\}/g, (_, name) => encodeURIComponent(`dast-${name}-${random()}`));
 }
 
-function zapApi(component, operation, params = {}) {
-    if (!API_KEY) {
-        throw new Error('DAST_ZAP_API_KEY não configurada.');
+function schemaSample(schema, invalid = false, spec = {}) {
+  if (!schema || typeof schema !== 'object') return invalid ? null : {};
+  if (schema.$ref) {
+    const key = schema.$ref.split('/').pop();
+    return schemaSample(spec.components?.schemas?.[key] || {}, invalid, spec);
+  }
+  if (schema.type === 'object' || schema.properties) {
+    const out = {};
+    for (const [key, child] of Object.entries(schema.properties || {})) {
+      out[key] = schemaSample(child, false, spec);
     }
-
-    const query = new URLSearchParams({ apikey: API_KEY, ...params });
-    const url = `${ZAP}/JSON/${component}/${operation}/?${query}`;
-
-    const output = execFileSync('curl', [
-        '--silent',
-        '--show-error',
-        '--fail',
-        '--max-time', '20',
-        url
-    ], {
-        encoding: 'utf8',
-        timeout: 25000,
-        maxBuffer: 10 * 1024 * 1024
-    });
-
-    const data = parseJson(output);
-
-    if (!data || data.code || data.Result === 'ERROR') {
-        throw new Error(`Resposta inválida da API ZAP: ${output}`);
+    if (invalid) {
+      const required = schema.required?.[0] || Object.keys(schema.properties || {})[0];
+      if (required) out[required] = { deliberately: 'invalid-type' };
+      else out.__dast_unexpected = { deliberately: 'unexpected-field' };
     }
-
-    return data;
+    return out;
+  }
+  if (schema.type === 'array') return invalid ? 'not-an-array' : [];
+  if (schema.type === 'integer' || schema.type === 'number') return invalid ? 'not-a-number' : 1;
+  if (schema.type === 'boolean') return invalid ? 'not-a-boolean' : true;
+  if (schema.type === 'string') {
+    if (invalid) return 123456;
+    if (schema.format === 'email') return `dast-${random()}@example.invalid`;
+    if (/password|secret|token/i.test(schema.title || '')) return `Dast-${random()}!`;
+    return 'dast-test-value';
+  }
+  return invalid ? { invalid: true } : null;
 }
 
-/*
- * A API do ZAP utiliza o parâmetro baseurl nessas operações.
- * O valor deve ser o endereço pelo qual o ZAP enxerga a aplicação,
- * não necessariamente o endereço usado pelo runner.
- */
-function zapMessageCount() {
-    const data = zapApi('core', 'view/numberOfMessages', {
-        baseurl: ZAP_BASE
-    });
-
-    const count = Number(data.numberOfMessages);
-
-    if (!Number.isInteger(count) || count < 0) {
-        throw new Error(`Contagem de mensagens ZAP inválida: ${JSON.stringify(data)}`);
-    }
-
-    return count;
+function operationBody(op, spec, invalid = false) {
+  const content = op.requestBody?.content || {};
+  const media = content['application/json'];
+  return media?.schema ? schemaSample(media.schema, invalid, spec) : undefined;
 }
 
-function latestZapMessageId(start) {
-    const data = zapApi('core', 'view/messages', {
-        baseurl: ZAP_BASE,
-        start: String(start),
-        count: '100'
-    });
-
-    const messages = data.messages || [];
-    const message = messages[messages.length - 1];
-    const id = message && (message.id ?? message.messageId);
-
-    if (id === undefined || id === null || id === '') {
-        return null;
-    }
-
-    return String(id);
+function securityRequired(op, spec) {
+  return Array.isArray(op.security) ? op.security.length > 0
+    : Array.isArray(spec.security) && spec.security.length > 0;
 }
 
-function request(method, route, options = {}) {
-    const url = BASE + route;
-    let start = null;
-    let captureError = null;
-
-    // A falha ao consultar a contagem não deve impedir a requisição à aplicação.
-    try {
-        start = zapMessageCount();
-    } catch (error) {
-        captureError = `Não foi possível consultar mensagens anteriores do ZAP: ${error.message}`;
-        errors.push(captureError);
-        console.error(`[DAST] WARNING: ${captureError}`);
-    }
-
-    const args = [
-        '--silent',
-        '--show-error',
-        '--max-time', '30',
-        '--proxy', PROXY,
-        '--noproxy', '',
-        '--request', method,
-        '--write-out', '\n__HTTP_STATUS__:%{http_code}',
-        '--url', url
-    ];
-
-    if (options.token) {
-        args.push('--header', `Authorization: Bearer ${options.token}`);
-    }
-
-    if (options.body !== undefined) {
-        args.push('--header', 'Content-Type: application/json');
-        args.push('--data-binary', JSON.stringify(options.body));
-    }
-
-    try {
-        const output = execFileSync('curl', args, {
-            encoding: 'utf8',
-            timeout: 35000,
-            maxBuffer: 10 * 1024 * 1024
-        });
-
-        const marker = '\n__HTTP_STATUS__:';
-        const index = output.lastIndexOf(marker);
-
-        if (index < 0) {
-            throw new Error('Código HTTP ausente na resposta do curl.');
-        }
-
-        const text = output.slice(0, index);
-        const status = Number(output.slice(index + marker.length).trim());
-
-        if (!Number.isInteger(status) || status <= 0) {
-            throw new Error(`Código HTTP inválido: ${output.slice(index + marker.length)}`);
-        }
-
-        let messageId = null;
-
-        if (start !== null) {
-            for (let attempt = 0; attempt < 10 && !messageId; attempt++) {
-                try {
-                    messageId = latestZapMessageId(start);
-                } catch (error) {
-                    captureError = `Falha ao localizar mensagem no ZAP: ${error.message}`;
-                }
-
-                if (!messageId) pause(250);
-            }
-        }
-
-        return {
-            status,
-            text,
-            json: parseJson(text),
-            url,
-            method,
-            messageId,
-            captureError
-        };
-    } catch (error) {
-        throw new Error(`${method} ${route}: ${error.message}`);
-    }
+function inspectSensitive(value, prefix = '') {
+  if (!value || typeof value !== 'object') return null;
+  for (const [key, child] of Object.entries(value)) {
+    if (/^(password|passwd|passwordhash|password_hash|hashedpassword|password_digest|credentialhash|credential_hash)$/i.test(key)
+      && child !== null && child !== '' && child !== false) return `${prefix}${key}`;
+    const nested = inspectSensitive(child, `${prefix}${key}.`);
+    if (nested) return nested;
+  }
+  return null;
 }
 
-function record(name, outcome, status, detail, evidence = '') {
-    tests.push({
-        id: name,
-        outcome,
-        httpStatus: status ?? null,
-        detail,
-        evidence
-    });
-
-    console.log(`[DAST] ${name} => ${outcome}; ${detail}`);
+function leaksInternals(text) {
+  return /\bat\s+\w+\s*\([^\n]*:\d+:\d+\)|\b(stack trace|syntaxerror|referenceerror|typeormerror|prisma\.[a-z]+error)\b|node_modules\/|\bselect\s+.+\s+from\s+|\b(insert into|update\s+\w+\s+set)\b/i.test(text || '');
 }
 
-function result(name, status, passed, detail) {
-    const outcome = passed
-        ? 'PASS'
-        : Number(status) >= 500
-            ? 'ERROR'
-            : 'NOT_EVALUATED';
-
-    record(name, outcome, status, detail, status ? `HTTP ${status}` : '');
-}
-
-function submitAlert(response, name, detail, risk, evidence) {
-    if (!response.messageId) {
-        throw new Error(
-            'A requisição não possui messageId registrado no ZAP; alerta não foi criado.'
-        );
-    }
-
-    const data = zapApi('alert', 'action/addAlert', {
-        messageId: response.messageId,
-        name,
-        riskId: String(risk ?? 2),
-        confidenceId: '2',
-        description: detail,
-        param: name,
-        attack: '',
-        evidence: evidence || `HTTP ${response.status}`,
-        otherInfo: 'Achado identificado por teste comportamental automatizado.',
-        solution: 'Valide autenticação e autorização no servidor; diferencie access tokens de refresh tokens; invalide refresh tokens após logout e rotação.',
-        references: 'https://www.zaproxy.org/docs/api/',
-        cweId: '862',
-        wascId: '0'
-    });
-
-    if (!data.id && !data.alertId && data.Result !== 'OK') {
-        throw new Error(`ZAP não confirmou a criação do alerta: ${JSON.stringify(data)}`);
-    }
-}
-
-function finding(response, name, detail, risk = 2, evidence = '') {
-    record(name, 'FAIL', response.status, detail, evidence || `HTTP ${response.status}`);
-
-    try {
-        submitAlert(response, name, detail, risk, evidence);
-    } catch (error) {
-        alertErrors++;
-        const message = `Falha ao enviar alerta "${name}": ${error.message}`;
-        errors.push(message);
-        console.error(`[DAST] WARNING: ${message}`);
-    }
-}
-
-function checkRejected(response, name, detail, risk = 2) {
-    if (isRejected(response.status)) {
-        result(name, response.status, true, detail);
-    } else if (is2xx(response.status)) {
-        finding(
-            response,
-            name,
-            `${detail} A API aceitou a requisição que deveria ser recusada.`,
-            risk
-        );
-    } else {
-        result(name, response.status, false, `${detail} Resposta inconclusiva.`);
-    }
-}
-
-function registerAccount(label) {
-    const account = {
-        email: `dast-extra-${label}-${random()}@example.invalid`,
-        password: `Dast-${random()}!`,
-        created: false,
-        access: null,
-        refresh: null
-    };
-
-    const registration = request('POST', '/auth/register', {
-        body: {
-            name: `DAST Extra User ${label}`,
-            email: account.email,
-            password: account.password
-        }
-    });
-
-    account.created = [200, 201, 202].includes(registration.status);
-
-    if (!account.created) {
-        result(
-            `Preparação: cadastro ${label}`,
-            registration.status,
-            false,
-            'Não foi possível criar a conta temporária.'
-        );
-        return account;
-    }
-
-    record(
-        `Preparação: cadastro ${label}`,
-        'PASS',
-        registration.status,
-        'Conta temporária criada.'
-    );
-
-    const login = request('POST', '/auth/login', {
-        body: {
-            email: account.email,
-            password: account.password
-        }
-    });
-
-    if (is2xx(login.status)) {
-        account.access = tokenFrom(
-            login.json,
-            ['accessToken', 'access_token', 'token']
-        );
-        account.refresh = tokenFrom(
-            login.json,
-            ['refreshToken', 'refresh_token']
-        );
-    }
-
-    record(
-        `Preparação: login ${label}`,
-        account.access
-            ? 'PASS'
-            : login.status >= 500
-                ? 'ERROR'
-                : 'NOT_EVALUATED',
-        login.status,
-        account.access ? 'Access token obtido.' : 'Access token não obtido.'
-    );
-
-    return account;
-}
-
-function checkNoCredentialLeak(response, name, password, expectedStatus) {
-    const text = response.text || '';
-    let leak = password && text.includes(password)
-        ? 'senha sentinela refletida'
-        : null;
-
-    function inspect(object, prefix = '') {
-        if (!object || typeof object !== 'object') return null;
-
-        for (const [key, value] of Object.entries(object)) {
-            if (
-                /^(password|passwd|passwordhash|password_hash|hashedpassword|password_digest|credentialhash|credential_hash)$/i.test(key) &&
-                value !== null &&
-                value !== '' &&
-                value !== false
-            ) {
-                return prefix + key;
-            }
-
-            if (value && typeof value === 'object') {
-                const nested = inspect(value, `${prefix}${key}.`);
-                if (nested) return nested;
-            }
-        }
-
-        return null;
-    }
-
-    leak = leak || inspect(response.json);
-
-    if (leak) {
-        finding(
-            response,
-            name,
-            `A resposta contém senha ou campo de senha/hash não vazio (${leak}).`,
-            3,
-            leak
-        );
-    } else if (
-        response.status >= 500 ||
-        (expectedStatus === 'rejected' && !isRejected(response.status)) ||
-        (expectedStatus !== 'rejected' && !is2xx(response.status))
-    ) {
-        result(
-            name,
-            response.status,
-            false,
-            'Não foi possível concluir a verificação devido à resposta recebida.'
-        );
-    } else {
-        result(
-            name,
-            response.status,
-            true,
-            'Nenhuma senha sentinela ou campo explícito de senha/hash foi detectado; isso não prova segurança do armazenamento.'
-        );
-    }
-}
-
-function runSuite() {
-    console.log(`[DAST] Início da suíte complementar em ${BASE}`);
-    console.log(`[DAST] Endereço da aplicação registrado no ZAP: ${ZAP_BASE}`);
-
-    // 1. Acesso sem autenticação.
-    checkRejected(
-        request('GET', '/users/me'),
-        'GET /users/me sem autenticação',
-        'O perfil deve exigir autenticação.',
-        3
-    );
-
-    const a = registerAccount('a');
-    const b = registerAccount('b');
-
-    // 2. Isolamento entre identidades.
-    if (a.access && b.access) {
-        const pa = request('GET', '/users/me', { token: a.access });
-        const pb = request('GET', '/users/me', { token: b.access });
-
-        const validA = pa.text.includes(a.email) && !pa.text.includes(b.email);
-        const validB = pb.text.includes(b.email) && !pb.text.includes(a.email);
-
-        if (validA && validB) {
-            result(
-                'Isolamento dos perfis A/B',
-                200,
-                true,
-                'Cada conta recebeu sua própria identidade.'
-            );
-        } else if (
-            is2xx(pa.status) &&
-            is2xx(pb.status) &&
-            (pa.text.includes(b.email) || pb.text.includes(a.email))
-        ) {
-            finding(
-                pb,
-                'Isolamento dos perfis A/B',
-                'Uma resposta de perfil parece conter a identidade da outra conta.',
-                3,
-                'Possível exposição cruzada de e-mail entre contas'
-            );
-        } else {
-            result(
-                'Isolamento dos perfis A/B',
-                pa.status,
-                false,
-                'Não foi possível confirmar o formato de identidade das respostas.'
-            );
-        }
-    } else {
-        result(
-            'Isolamento dos perfis A/B',
-            null,
-            false,
-            'Duas contas/tokens não disponíveis.'
-        );
-    }
-
-    // 3. Confusão entre tipos de token.
-    if (a.refresh) {
-        checkRejected(
-            request('GET', '/users/me', { token: a.refresh }),
-            'Refresh token usado como access token',
-            'Refresh token não deve autorizar recursos protegidos.',
-            3
-        );
-    } else {
-        result(
-            'Refresh token usado como access token',
-            null,
-            false,
-            'Refresh token ausente.'
-        );
-    }
-
-    if (a.access) {
-        checkRejected(
-            request('POST', '/auth/refresh', {
-                body: { refreshToken: a.access }
-            }),
-            'Access token usado como refresh token',
-            'Access token não deve ser aceito como credencial de renovação.',
-            3
-        );
-    } else {
-        result(
-            'Access token usado como refresh token',
-            null,
-            false,
-            'Access token ausente.'
-        );
-    }
-
-    // 4. Rotação e invalidação após logout.
-    if (a.created) {
-        const session = request('POST', '/auth/login', {
-            body: {
-                email: a.email,
-                password: a.password
-            }
-        });
-
-        const refresh = tokenFrom(
-            session.json,
-            ['refreshToken', 'refresh_token']
-        );
-
-        if (refresh) {
-            const rotated = request('POST', '/auth/refresh', {
-                body: { refreshToken: refresh }
-            });
-
-            if (is2xx(rotated.status)) {
-                checkRejected(
-                    request('POST', '/auth/refresh', {
-                        body: { refreshToken: refresh }
-                    }),
-                    'Reutilização de refresh token após rotação',
-                    'O token anterior deve ser invalidado quando há rotação.',
-                    2
-                );
-            } else {
-                result(
-                    'Reutilização de refresh token após rotação',
-                    rotated.status,
-                    false,
-                    'Renovação inicial não funcionou.'
-                );
-            }
-
-            const logoutSession = request('POST', '/auth/login', {
-                body: {
-                    email: a.email,
-                    password: a.password
-                }
-            });
-
-            const logoutAccess = tokenFrom(
-                logoutSession.json,
-                ['accessToken', 'access_token', 'token']
-            );
-            const logoutRefresh = tokenFrom(
-                logoutSession.json,
-                ['refreshToken', 'refresh_token']
-            );
-
-            if (logoutAccess && logoutRefresh) {
-                const logout = request('POST', '/auth/logout', {
-                    token: logoutAccess,
-                    body: { refreshToken: logoutRefresh }
-                });
-
-                if (is2xx(logout.status)) {
-                    checkRejected(
-                        request('POST', '/auth/refresh', {
-                            body: { refreshToken: logoutRefresh }
-                        }),
-                        'Refresh token após logout',
-                        'Refresh token revogado não deve renovar a sessão.',
-                        2
-                    );
-                } else {
-                    result(
-                        'Refresh token após logout',
-                        logout.status,
-                        false,
-                        'Logout não confirmou sucesso.'
-                    );
-                }
-            } else {
-                result(
-                    'Refresh token após logout',
-                    null,
-                    false,
-                    'Tokens da sessão de logout ausentes.'
-                );
-            }
-        } else {
-            result(
-                'Rotação/logout de refresh token',
-                null,
-                false,
-                'Refresh token ausente.'
-            );
-        }
-    }
-
-    // 5. Exposição de credenciais.
-    const sentinel = `Sentinel-${random()}!`;
-
-    const registration = request('POST', '/auth/register', {
-        body: {
-            name: 'DAST Credential Check',
-            email: `dast-cred-${random()}@example.invalid`,
-            password: sentinel
-        }
-    });
-
-    const invalidLogin = request('POST', '/auth/login', {
-        body: {
-            email: `missing-${random()}@example.invalid`,
-            password: `Sentinel-${random()}!`
-        }
-    });
-
-    checkNoCredentialLeak(
-        registration,
-        'Cadastro não expõe senha/hash',
-        sentinel
-    );
-
-    checkNoCredentialLeak(
-        invalidLogin,
-        'Login inválido não expõe senha/hash',
-        null,
-        'rejected'
-    );
-
-    if (a.access) {
-        checkNoCredentialLeak(
-            request('GET', '/users/me', { token: a.access }),
-            'Perfil não expõe senha/hash',
-            a.password
-        );
-    } else {
-        result(
-            'Perfil não expõe senha/hash',
-            null,
-            false,
-            'Access token indisponível.'
-        );
-    }
-
-    console.log('[DAST] Fim da suíte complementar.');
-}
-
-function writeSummary() {
-    const counts = {
-        PASS: 0,
-        FAIL: 0,
-        NOT_EVALUATED: 0,
-        ERROR: 0
-    };
-
-    for (const test of tests) {
-        if (Object.hasOwn(counts, test.outcome)) {
-            counts[test.outcome]++;
-        }
-    }
-
-    const summary = {
-        schemaVersion: 1,
-        completed: true,
-        total: tests.length,
-        counts,
-        alertSubmissionErrors: alertErrors,
-        infrastructureErrors: errors,
-        tests
-    };
-
-    fs.mkdirSync(path.dirname(OUTPUT), { recursive: true });
-    fs.writeFileSync(OUTPUT, JSON.stringify(summary, null, 2), 'utf8');
-
-    console.log(
-        `[DAST] Resumo salvo em ${OUTPUT}: ${JSON.stringify(counts)}`
-    );
+function classifyStatus(status) {
+  return status >= 500 ? 'ERROR' : 'NOT_EVALUATED';
 }
 
 function main() {
+  fs.mkdirSync(OUT, { recursive: true });
+  const specResponse = curl('GET', OPENAPI);
+  if (!is2xx(specResponse.status) || !specResponse.data?.paths || typeof specResponse.data.paths !== 'object') {
+    throw new Error(`OpenAPI indisponível ou inválido em ${OPENAPI} (HTTP ${specResponse.status}).`);
+  }
+  const spec = specResponse.data;
+  fs.writeFileSync(path.join(OUT, 'openapi.json'), JSON.stringify(spec, null, 2));
+
+  const operations = [];
+  for (const [route, pathItem] of Object.entries(spec.paths)) {
+    for (const method of METHODS) {
+      const op = pathItem?.[method];
+      if (op && typeof op === 'object') operations.push({ route, method: method.toUpperCase(), op, pathItem });
+    }
+  }
+  const selected = operations.slice(0, MAX_OPERATIONS);
+  add('GERAL', 'openapi-discovery', 'PASS', `${operations.length} operações descobertas; ${selected.length} serão avaliadas pelo limite de execução.`, { totalOperations: operations.length });
+
+  // RS01: testa operações declaradas como protegidas sem fornecer credenciais.
+  const protectedOps = selected.filter(x => securityRequired(x.op, spec) && ['GET', 'HEAD', 'OPTIONS'].includes(x.method));
+  if (!protectedOps.length) add('RS01', 'protected-operations', 'NOT_EVALUATED', 'OpenAPI não declarou operações com requisito de segurança; não é possível presumir quais recursos exigem autenticação.');
+  for (const x of protectedOps) {
     try {
-        if (!API_KEY) {
-            throw new Error('DAST_ZAP_API_KEY não configurada.');
-        }
+      const route = resolvePath(x.route);
+      const response = curl(x.method, BASE + route);
+      if ([401, 403].includes(response.status)) add('RS01', `${x.method} ${x.route} unauthenticated`, 'PASS', 'Operação declarada como protegida recusou acesso sem credenciais.', { httpStatus: response.status });
+      else if (is2xx(response.status)) add('RS01', `${x.method} ${x.route} unauthenticated`, 'FAIL', 'Operação declarada como protegida aceitou acesso sem credenciais.', { httpStatus: response.status });
+      else add('RS01', `${x.method} ${x.route} unauthenticated`, classifyStatus(response.status), `Resposta não conclusiva para controle de acesso.`, { httpStatus: response.status });
+      if (leaksInternals(response.text)) add('RS02/RS07', `${x.method} ${x.route} error-disclosure`, 'FAIL', 'Resposta expôs padrão associado a detalhes internos.', { httpStatus: response.status });
+      const sensitive = inspectSensitive(response.data);
+      if (sensitive) add('RS04', `${x.method} ${x.route} credential-exposure`, 'FAIL', `Resposta contém campo sensível: ${sensitive}.`, { httpStatus: response.status });
+    } catch (e) { add('RS01', `${x.method} ${x.route}`, 'ERROR', e.message); }
+  }
 
-        runSuite();
-    } catch (error) {
-        errors.push(error.message);
-        console.error(`[DAST] ERROR: ${error.message}`);
-    } finally {
-        try {
-            writeSummary();
-        } catch (error) {
-            errors.push(`Falha ao salvar resumo: ${error.message}`);
-            console.error(`[DAST] ERROR: ${error.message}`);
-        }
-    }
+  // RS02, RS04 e RS07: inspeciona respostas de operações documentadas, sem autenticação.
+  for (const x of selected.filter(v => ['GET', 'HEAD', 'OPTIONS'].includes(v.method))) {
+    try {
+      const route = resolvePath(x.route);
+      const response = curl(x.method, BASE + route);
+      const runtimeSecrets = [process.env.JWT_ACCESS_SECRET, process.env.JWT_REFRESH_SECRET].filter(Boolean);
+      if (runtimeSecrets.some(secret => response.text.includes(secret))) add('RS02', `${x.method} ${x.route} runtime-secret`, 'FAIL', 'Resposta reproduziu segredo de autenticação configurado no ambiente.', { httpStatus: response.status });
+      const sensitive = inspectSensitive(response.data);
+      if (sensitive) add('RS04', `${x.method} ${x.route} credential-exposure`, 'FAIL', `Campo sensível exposto: ${sensitive}.`, { httpStatus: response.status });
+      if (leaksInternals(response.text)) add('RS02/RS07', `${x.method} ${x.route} internal-error-disclosure`, 'FAIL', 'Resposta contém stack trace, caminho interno, erro de implementação ou detalhe de consulta.', { httpStatus: response.status });
+      if (response.status >= 500) add('RS07', `${x.method} ${x.route} server-error`, 'FAIL', 'Operação documentada produziu resposta HTTP 5xx durante a sondagem sem autenticação.', { httpStatus: response.status });
+    } catch (e) { add('RS02/RS04/RS07', `${x.method} ${x.route}`, 'ERROR', e.message); }
+  }
 
-    if (errors.length) {
-        process.exitCode = 1;
+  // RS05: envia corpo JSON deliberadamente incompatível com o schema documentado.
+  let bodyTests = 0;
+  for (const x of selected.filter(v => ['POST', 'PUT', 'PATCH'].includes(v.method) && v.op.requestBody).slice(0, MAX_BODY_TESTS)) {
+    try {
+      const body = operationBody(x.op, spec, true);
+      if (body === undefined) { add('RS05', `${x.method} ${x.route} invalid-input`, 'NOT_EVALUATED', 'O OpenAPI não documenta corpo application/json para esta operação.'); continue; }
+      const response = curl(x.method, BASE + resolvePath(x.route), body);
+      if ([400, 415, 422].includes(response.status)) add('RS05', `${x.method} ${x.route} invalid-input`, 'PASS', 'Entrada incompatível com o schema foi rejeitada.', { httpStatus: response.status });
+      else if (is2xx(response.status)) add('RS05', `${x.method} ${x.route} invalid-input`, 'FAIL', 'A API aceitou entrada deliberadamente incompatível com o schema.', { httpStatus: response.status });
+      else add('RS05', `${x.method} ${x.route} invalid-input`, classifyStatus(response.status), 'Resposta não conclusiva para validação de entrada.', { httpStatus: response.status });
+      if (leaksInternals(response.text)) add('RS07', `${x.method} ${x.route} invalid-input-error`, 'FAIL', 'Entrada inválida provocou exposição de detalhes internos.', { httpStatus: response.status });
+      bodyTests++;
+    } catch (e) { add('RS05', `${x.method} ${x.route} invalid-input`, 'ERROR', e.message); }
+  }
+  if (!bodyTests) add('RS05', 'invalid-input', 'NOT_EVALUATED', 'OpenAPI não forneceu corpos de requisição JSON adequados para sondagem segura.');
+
+  // RS06: identifica operações candidatas por metadados OpenAPI, sem fixar rotas.
+  const authCandidates = selected.filter(x => {
+    const meta = `${x.op.operationId || ''} ${x.op.summary || ''} ${x.op.description || ''} ${(x.op.tags || []).join(' ')}`;
+    const schemaText = json(x.op.requestBody || {});
+    return /login|sign.?in|authenticate|token|authenticat/i.test(meta) && /password|credential/i.test(schemaText);
+  });
+  if (!authCandidates.length) {
+    add('RS06', 'authentication-operation', 'NOT_EVALUATED', 'OpenAPI não identificou inequivocamente operação de autenticação com credencial; não foram inventadas rotas ou payloads.');
+  } else {
+    for (const candidate of authCandidates.slice(0, 2)) {
+      const emailField = (obj, prefix = '') => {
+        if (!obj || typeof obj !== 'object') return null;
+        for (const [key, value] of Object.entries(obj)) {
+          if (/^(email|username|user)$/i.test(key)) return `${prefix}${key}`;
+          if (value && typeof value === 'object') { const found = emailField(value, `${prefix}${key}.`); if (found) return found; }
+        }
+        return null;
+      };
+      const basePayload = operationBody(candidate.op, spec, false);
+      if (!basePayload || typeof basePayload !== 'object' || Array.isArray(basePayload)) {
+        add('RS06', `${candidate.method} ${candidate.route} repeated-invalid-login`, 'NOT_EVALUATED', 'O schema da operação candidata não permite construir um corpo de credenciais com segurança.');
+        continue;
+      }
+      const emailKey = emailField(basePayload);
+      const passwordKey = Object.keys(basePayload).find(k => /password|passwd/i.test(k));
+      if (!emailKey || !passwordKey) {
+        add('RS06', `${candidate.method} ${candidate.route} repeated-invalid-login`, 'NOT_EVALUATED', 'Não foi possível identificar os campos de usuário e senha no corpo documentado.');
+        continue;
+      }
+      const attemptResponses = [];
+      try {
+        for (let i = 0; i < 5; i++) {
+          const payload = structuredClone(basePayload);
+          payload[emailKey] = `dast-invalid-${random()}@example.invalid`;
+          payload[passwordKey] = `Invalid-${random()}!`;
+          attemptResponses.push(curl(candidate.method, BASE + resolvePath(candidate.route), payload));
+        }
+        if (attemptResponses.some(r => [423, 429].includes(r.status))) {
+          add('RS06', `${candidate.method} ${candidate.route} repeated-invalid-login`, 'PASS', 'A API aplicou resposta de bloqueio ou limitação durante cinco tentativas inválidas.', { httpStatuses: attemptResponses.map(r => r.status) });
+        } else if (attemptResponses.some(r => is2xx(r.status))) {
+          add('RS06', `${candidate.method} ${candidate.route} repeated-invalid-login`, 'FAIL', 'Uma tentativa com credenciais sintéticas inválidas foi aceita.', { httpStatuses: attemptResponses.map(r => r.status) });
+        } else if (attemptResponses.some(r => r.status >= 500)) {
+          add('RS06', `${candidate.method} ${candidate.route} repeated-invalid-login`, 'ERROR', 'A API apresentou erro de servidor durante tentativas inválidas.', { httpStatuses: attemptResponses.map(r => r.status) });
+        } else {
+          add('RS06', `${candidate.method} ${candidate.route} repeated-invalid-login`, 'NOT_EVALUATED', 'As tentativas foram recusadas, mas a especificação não define limite ou política de bloqueio; não é possível concluir se há proteção contra automação.', { httpStatuses: attemptResponses.map(r => r.status) });
+        }
+      } catch (e) { add('RS06', `${candidate.method} ${candidate.route} repeated-invalid-login`, 'ERROR', e.message); }
     }
+  }
+
+  // RS02: segredo de ambiente não deve aparecer em respostas ou mensagens.
+  const secrets = [process.env.JWT_ACCESS_SECRET, process.env.JWT_REFRESH_SECRET].filter(Boolean);
+  if (secrets.length) {
+    const observed = results.some(r => r.detail && secrets.some(secret => r.detail.includes(secret)));
+    add('RS02', 'runtime-secret-disclosure', observed ? 'FAIL' : 'PASS', observed ? 'Segredo de execução apareceu nas evidências de resposta.' : 'Segredos de execução não foram encontrados nos textos analisados.');
+  } else add('RS02', 'runtime-secret-disclosure', 'NOT_EVALUATED', 'Segredos de execução não foram disponibilizados ao script para comparação.');
+
+  const counts = Object.fromEntries(['PASS', 'FAIL', 'NOT_EVALUATED', 'ERROR'].map(k => [k, results.filter(x => x.outcome === k).length]));
+  const report = { schemaVersion: 2, completed: true, source: '/openapi.json', excludedRequirements: ['RS03'], requirements: ['RS01', 'RS02', 'RS04', 'RS05', 'RS06', 'RS07'], totalOperations: operations.length, testedOperations: selected.length, counts, tests: results };
+  fs.writeFileSync(path.join(OUT, 'dast-tests.json'), JSON.stringify(report, null, 2));
+  console.log(`[DAST] Concluído: ${JSON.stringify(counts)}`);
 }
 
-main();
+try { main(); }
+catch (error) {
+  fs.mkdirSync(OUT, { recursive: true });
+  const report = { schemaVersion: 2, completed: false, excludedRequirements: ['RS03'], counts: { PASS: 0, FAIL: 0, NOT_EVALUATED: 0, ERROR: 1 }, tests: [{ requirement: 'GERAL', id: 'executor', outcome: 'ERROR', detail: error.message }] };
+  fs.writeFileSync(path.join(OUT, 'dast-tests.json'), JSON.stringify(report, null, 2));
+  console.error(`[DAST] Falha: ${error.stack || error}`);
+  process.exitCode = 1;
+}

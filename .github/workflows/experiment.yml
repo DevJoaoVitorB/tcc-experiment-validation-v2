@@ -352,367 +352,108 @@ jobs:
         env:
             JWT_ACCESS_SECRET: 'dast-test-access-secret-CHANGE-ME-123456789'
             JWT_REFRESH_SECRET: 'dast-test-refresh-secret-CHANGE-ME-123456789'
-
-            DAST_CONFIG_DIR: workflows_support/dast
-            DAST_PLAN: workflows_support/dast/dast.rules.yml
-
-            # Endereço utilizado pelo runner do GitHub Actions.
             DAST_BASE_URL: http://127.0.0.1:3000
-
-            # Endereço utilizado pelo ZAP dentro do container Docker.
             ZAP_BASE_URL: http://host.docker.internal:3000
-
             ZAP_API_URL: http://127.0.0.1:8080
-            ZAP_PROXY_URL: http://127.0.0.1:8080
-
-            DAST_OUTPUT_DIR: evidence/dast
+            DAST_PLAN: workflows_support/dast/dast.rules.yml
+            DAST_SCRIPT: workflows_support/dast/dast.script.js
             DAST_IMAGE: authentication-api:dast-${{ inputs.experiment_group }}
-            EVIDENCE_DIR: evidence/dast
+            DAST_OUTPUT_DIR: evidence/dast
 
         steps:
             - name: Checkout repository
               uses: actions/checkout@v4
 
-            - name: Initialize DAST evidence
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: '22'
+
+            - name: Build and start application
               shell: bash
               run: |
                   set -euo pipefail
-
-                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
-                  mkdir -p "$EVIDENCE_DIR"
-
-                  {
-                    echo "experiment_group=${{ inputs.experiment_group }}"
-                    echo "run_id=${GITHUB_RUN_ID}"
-                    echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
-                    echo "commit=${GITHUB_SHA}"
-                    echo "event=${GITHUB_EVENT_NAME}"
-                    echo "zap_image=zaproxy/zap-stable"
-                    echo "dast_image=$DAST_IMAGE"
-                    echo "dast_base_url=$DAST_BASE_URL"
-                    echo "zap_base_url=$ZAP_BASE_URL"
-                  } > "$EVIDENCE_DIR/metadata.txt"
-
-            - name: Build application Docker image
-              id: build
-              shell: bash
-              run: |
-                  set -euo pipefail
-
-                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
-
-                  set +e
-                  docker build --tag "$DAST_IMAGE" . \
-                    2>&1 | tee "$EVIDENCE_DIR/docker-build.log"
-                  status=${PIPESTATUS[0]}
-                  set -e
-
-                  echo "docker_build_exit_code=$status" \
-                    >> "$EVIDENCE_DIR/metadata.txt"
-
-                  exit "$status"
-
-            - name: Start application
-              id: app
-              shell: bash
-              run: |
-                  set -euo pipefail
-
-                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
-
-                  docker run -d \
-                    --name dast-api \
-                    --publish 3000:3000 \
+                  mkdir -p "$DAST_OUTPUT_DIR"
+                  docker build -t "$DAST_IMAGE" . 2>&1 | tee "$DAST_OUTPUT_DIR/docker-build.log"
+                  docker run -d --name dast-api --publish 3000:3000 \
                     --env NODE_ENV=test \
                     --env DATABASE_URL='file:./test.db' \
                     --env JWT_ACCESS_SECRET="$JWT_ACCESS_SECRET" \
                     --env JWT_REFRESH_SECRET="$JWT_REFRESH_SECRET" \
-                    "$DAST_IMAGE" \
-                    > "$EVIDENCE_DIR/container-id.txt"
-
-            - name: Wait for application readiness
-              id: readiness
-              shell: bash
-              run: |
-                  set -euo pipefail
-
-                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+                    "$DAST_IMAGE" > "$DAST_OUTPUT_DIR/container-id.txt"
                   ready=false
-
                   for attempt in $(seq 1 60); do
-                    status=$(curl -sS --max-time 3 \
-                      -o "$EVIDENCE_DIR/readiness-response.txt" \
-                      -w '%{http_code}' \
-                      "$DAST_BASE_URL/health" 2>/dev/null || true)
-
-                    if [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
-                      ready=true
-                      break
-                    fi
-
-                    if [ "$(docker inspect -f '{{.State.Running}}' dast-api 2>/dev/null || echo false)" != "true" ]; then
-                      break
-                    fi
-
+                    if curl -fsS --max-time 3 "$DAST_BASE_URL/openapi.json" \
+                      -o "$DAST_OUTPUT_DIR/openapi.json"; then ready=true; break; fi
+                    if [ "$(docker inspect -f '{{.State.Running}}' dast-api 2>/dev/null || echo false)" != true ]; then break; fi
                     sleep 2
                   done
-
-                  echo "application_ready=$ready" \
-                    >> "$EVIDENCE_DIR/metadata.txt"
-
-                  docker logs dast-api \
-                    > "$EVIDENCE_DIR/application.log" 2>&1 || true
-
-                  if [ "$ready" != "true" ]; then
-                    echo "A aplicação não ficou disponível em /health." \
-                      | tee "$EVIDENCE_DIR/error.txt"
+                  if [ "$ready" != true ] || ! jq -e '(.paths | type == "object") and (.paths | length > 0)' "$DAST_OUTPUT_DIR/openapi.json" >/dev/null; then
+                    echo "::error::A API não disponibilizou uma especificação OpenAPI válida em /openapi.json."
                     exit 1
                   fi
 
-            - name: Verify DAST configuration and scripts
-              shell: bash
-              run: |
-                  set -euo pipefail
-
-                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
-
-                  PLAN="$GITHUB_WORKSPACE/$DAST_PLAN"
-                  SCRIPT="$GITHUB_WORKSPACE/$DAST_CONFIG_DIR/dast.script.js"
-
-                  if [ ! -s "$PLAN" ]; then
-                    echo "::error::Plano DAST ausente ou vazio: $PLAN"
-                    exit 1
-                  fi
-
-                  if [ ! -s "$SCRIPT" ]; then
-                    echo "::error::Script complementar ausente ou vazio: $SCRIPT"
-                    exit 1
-                  fi
-
-                  if ! curl -fsS --max-time 5 \
-                    "$DAST_BASE_URL/openapi.json" \
-                    -o "$EVIDENCE_DIR/openapi.json"; then
-                    echo "::error::Não foi possível obter /openapi.json."
-                    exit 1
-                  fi
-
-                  if ! jq -e '
-                    type == "object" and
-                    (.paths | type == "object") and
-                    (.paths | length > 0)
-                  ' "$EVIDENCE_DIR/openapi.json" >/dev/null; then
-                    echo "::error::Documento OpenAPI inválido ou sem rotas."
-                    exit 1
-                  fi
-
-                  echo "Plano DAST, script e OpenAPI validados." \
-                    | tee "$EVIDENCE_DIR/config-validation.txt"
-
-            - name: Setup Node.js for behavioral DAST
-              uses: actions/setup-node@v4
-              with:
-                  node-version: '22.14.0'
-
-            - name: Run OWASP ZAP Automation Plan
-              id: zap
+            - name: Run ZAP and complementary security tests
               shell: bash
               run: |
                   set -Eeuo pipefail
-
-                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
-                  ZAP_API="$ZAP_API_URL"
-                  PLAN_PATH="/zap/wrk/$DAST_PLAN"
-                  DAST_ZAP_API_KEY=$(openssl rand -hex 32)
-
-                  mkdir -p "$EVIDENCE_DIR"
-
-                  echo "DAST_ZAP_API_KEY=$DAST_ZAP_API_KEY" >> "$GITHUB_ENV"
-
-                  docker run -d \
-                    --name dast-zap \
-                    --add-host=host.docker.internal:host-gateway \
-                    --publish 8080:8080 \
-                    --volume "$GITHUB_WORKSPACE:/zap/wrk:ro" \
-                    --volume "$EVIDENCE_DIR:/zap/out:rw" \
-                    zaproxy/zap-stable \
-                    zap.sh -daemon \
-                      -host 0.0.0.0 \
-                      -port 8080 \
-                      -config "api.key=$DAST_ZAP_API_KEY" \
-                      -config "api.addrs.addr.name=.*" \
-                      -config "api.addrs.addr.regex=true"
-
+                  KEY=$(openssl rand -hex 32)
+                  echo "DAST_ZAP_API_KEY=$KEY" >> "$GITHUB_ENV"
+                  docker run -d --name dast-zap --add-host=host.docker.internal:host-gateway \
+                    --publish 8080:8080 --volume "$GITHUB_WORKSPACE:/zap/wrk:ro" \
+                    --volume "$GITHUB_WORKSPACE/$DAST_OUTPUT_DIR:/zap/out:rw" zaproxy/zap-stable \
+                    zap.sh -daemon -host 0.0.0.0 -port 8080 \
+                    -config "api.key=$KEY" -config "api.addrs.addr.name=.*" -config "api.addrs.addr.regex=true"
                   ready=false
-
                   for attempt in $(seq 1 90); do
-                    if ! docker inspect -f '{{.State.Running}}' dast-zap 2>/dev/null \
-                      | grep -qx true; then
-                      echo "::error::O container OWASP ZAP foi encerrado."
-                      docker logs dast-zap --tail 150 || true
-                      exit 1
-                    fi
-
-                    if curl -fsS --connect-timeout 3 --max-time 5 \
-                      -G "$ZAP_API/JSON/core/view/version/" \
-                      --data-urlencode "apikey=$DAST_ZAP_API_KEY" \
-                      -o "$EVIDENCE_DIR/zap-version.json" \
-                      2>/dev/null; then
-                      ready=true
-                      break
-                    fi
-
+                    if curl -fsS --max-time 5 -G "$ZAP_API_URL/JSON/core/view/version/" \
+                      --data-urlencode "apikey=$KEY" -o "$DAST_OUTPUT_DIR/zap-version.json"; then ready=true; break; fi
                     sleep 2
                   done
-
-                  if [ "$ready" != "true" ]; then
-                    echo "::error::OWASP ZAP não ficou disponível."
-                    docker logs dast-zap --tail 150 \
-                      > "$EVIDENCE_DIR/zap-startup-error.log" 2>&1 || true
-                    cat "$EVIDENCE_DIR/zap-startup-error.log"
-                    exit 1
-                  fi
-
-                  jq -e '.version' "$EVIDENCE_DIR/zap-version.json" >/dev/null
-
-                  echo "zap_version=$(jq -r '.version' "$EVIDENCE_DIR/zap-version.json")" \
-                    >> "$EVIDENCE_DIR/metadata.txt"
-
-                  if ! curl -fsS --connect-timeout 5 --max-time 30 -G \
-                    "$ZAP_API/JSON/automation/action/runPlan/" \
-                    --data-urlencode "apikey=$DAST_ZAP_API_KEY" \
-                    --data-urlencode "filePath=$PLAN_PATH" \
-                    -o "$EVIDENCE_DIR/zap-plan-start.json"; then
-                    echo "::error::Não foi possível iniciar o plano DAST."
-                    docker logs dast-zap --tail 150 || true
-                    exit 1
-                  fi
-
-                  plan_id=$(jq -r '.planId // empty' \
-                    "$EVIDENCE_DIR/zap-plan-start.json")
-
-                  if [ -z "$plan_id" ]; then
-                    echo "::error::O ZAP não retornou o identificador do plano."
-                    cat "$EVIDENCE_DIR/zap-plan-start.json"
-                    exit 1
-                  fi
-
-                  echo "zap_plan_id=$plan_id" >> "$EVIDENCE_DIR/metadata.txt"
-
+                  [ "$ready" = true ] || { docker logs dast-zap --tail 100; exit 1; }
+                  curl -fsS -G "$ZAP_API_URL/JSON/automation/action/runPlan/" \
+                    --data-urlencode "apikey=$KEY" \
+                    --data-urlencode "filePath=/zap/wrk/$DAST_PLAN" \
+                    -o "$DAST_OUTPUT_DIR/zap-plan-start.json"
+                  PLAN_ID=$(jq -r '.planId // empty' "$DAST_OUTPUT_DIR/zap-plan-start.json")
+                  [ -n "$PLAN_ID" ] || { cat "$DAST_OUTPUT_DIR/zap-plan-start.json"; exit 1; }
                   completed=false
-
                   for attempt in $(seq 1 900); do
-                    if ! docker inspect -f '{{.State.Running}}' dast-zap 2>/dev/null \
-                      | grep -qx true; then
-                      echo "::error::O container ZAP encerrou durante a análise."
-                      docker logs dast-zap --tail 150 || true
-                      exit 1
+                    curl -fsS -G "$ZAP_API_URL/JSON/automation/view/planProgress/" \
+                      --data-urlencode "apikey=$KEY" --data-urlencode "planId=$PLAN_ID" \
+                      -o "$DAST_OUTPUT_DIR/zap-plan-progress.json" || true
+                    if [ -s "$DAST_OUTPUT_DIR/zap-plan-progress.json" ] && jq -e '.finished != null and .finished != ""' "$DAST_OUTPUT_DIR/zap-plan-progress.json" >/dev/null; then
+                      jq -e '(.error // []) | length == 0' "$DAST_OUTPUT_DIR/zap-plan-progress.json" >/dev/null
+                      completed=true; break
                     fi
-
-                    if curl -fsS --connect-timeout 5 --max-time 15 -G \
-                      "$ZAP_API/JSON/automation/view/planProgress/" \
-                      --data-urlencode "apikey=$DAST_ZAP_API_KEY" \
-                      --data-urlencode "planId=$plan_id" \
-                      -o "$EVIDENCE_DIR/zap-plan-progress.json" \
-                      2>/dev/null; then
-
-                      finished=$(jq -r '.finished // empty' \
-                        "$EVIDENCE_DIR/zap-plan-progress.json")
-
-                      if [ -n "$finished" ]; then
-                        if jq -e '(.error // []) | length > 0' \
-                          "$EVIDENCE_DIR/zap-plan-progress.json" >/dev/null; then
-                          echo "::error::O Automation Framework terminou com erros."
-                          jq '{warn, error, info, started, finished}' \
-                            "$EVIDENCE_DIR/zap-plan-progress.json"
-                          exit 1
-                        fi
-
-                        completed=true
-                        break
-                      fi
-                    fi
-
                     sleep 2
                   done
-
-                  if [ "$completed" != "true" ]; then
-                    echo "::error::Tempo limite aguardando conclusão do plano DAST."
-                    docker logs dast-zap --tail 200 \
-                      > "$EVIDENCE_DIR/zap-plan-error.log" 2>&1 || true
-                    cat "$EVIDENCE_DIR/zap-plan-error.log"
-                    exit 1
-                  fi
-
-                  echo "zap_plan_completed=true" >> "$EVIDENCE_DIR/metadata.txt"
-                  echo "Automation Framework concluído."
-
-            - name: Run behavioral DAST tests
-              id: behavioral_dast
-              shell: bash
-              env:
-                  DAST_BASE_URL: ${{ env.DAST_BASE_URL }}
-                  ZAP_API_URL: ${{ env.ZAP_API_URL }}
-                  ZAP_PROXY_URL: ${{ env.ZAP_PROXY_URL }}
-                  DAST_OUTPUT_DIR: ${{ env.DAST_OUTPUT_DIR }}
-              run: |
-                  set -euo pipefail
-
-                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
-
-                  # O projeto utiliza type: module.
-                  # A cópia .cjs preserva o script CommonJS sem alterar package.json.
-                  cp "$DAST_CONFIG_DIR/dast.script.js" \
-                    "$EVIDENCE_DIR/dast.script.cjs"
-
-                  node --check "$EVIDENCE_DIR/dast.script.cjs"
-
-                  node "$EVIDENCE_DIR/dast.script.cjs" \
-                    2>&1 | tee "$EVIDENCE_DIR/dast-script.log"
-
-                  if [ ! -s "$EVIDENCE_DIR/dast-tests.json" ]; then
-                    echo "::error::O executor não gerou dast-tests.json."
-                    exit 1
-                  fi
-
-                  jq -e '.schemaVersion == 1 and (.tests | type == "array")' \
-                    "$EVIDENCE_DIR/dast-tests.json" >/dev/null
-
-            - name: Generate consolidated ZAP reports
-              id: zap_reports
-              shell: bash
-              run: |
-                  set -euo pipefail
-
-                  ZAP_API="$ZAP_API_URL"
-                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
-
-                  mkdir -p "$EVIDENCE_DIR"
-
-                  curl -sS -G \
-                    -o "$EVIDENCE_DIR/zap-diagnostic.json" \
-                    -w "HTTP status: %{http_code}\n" \
-                    "$ZAP_API/JSON/reports/action/generate/" \
-                    --data-urlencode "apikey=$DAST_ZAP_API_KEY" \
-                    --data-urlencode "title=DAST - Authentication API" \
-                    --data-urlencode "template=traditional-json"
-
-                  cat "$EVIDENCE_DIR/zap-diagnostic.json"
+                  [ "$completed" = true ] || { echo "::error::Tempo limite do plano ZAP."; exit 1; }
+                  node --check "$DAST_SCRIPT"
+                  node "$DAST_SCRIPT" 2>&1 | tee "$DAST_OUTPUT_DIR/dast-script.log"
+                  for template in traditional-json traditional-html; do
+                    case "$template" in traditional-json) file=zap-report.json ;; traditional-html) file=zap-report.html ;; esac
+                    curl -fsS -G "$ZAP_API_URL/JSON/reports/action/generate/" \
+                      --data-urlencode "apikey=$KEY" \
+                      --data-urlencode "title=DAST - Authentication API" \
+                      --data-urlencode "template=$template" \
+                      -o "$DAST_OUTPUT_DIR/$file.response"
+                    REPORT_PATH=$(jq -r '.generate // empty' "$DAST_OUTPUT_DIR/$file.response")
+                    [ -n "$REPORT_PATH" ] || { cat "$DAST_OUTPUT_DIR/$file.response"; exit 1; }
+                    docker cp "dast-zap:$REPORT_PATH" "$DAST_OUTPUT_DIR/$file"
+                    [ -s "$DAST_OUTPUT_DIR/$file" ] || exit 1
+                  done
+                  jq -e . "$DAST_OUTPUT_DIR/zap-report.json" >/dev/null
+                  { echo "experiment_group=${{ inputs.experiment_group }}"; echo "commit=$GITHUB_SHA"; echo "zap_version=$(jq -r '.version' "$DAST_OUTPUT_DIR/zap-version.json")"; echo "zap_plan_completed=true"; } > "$DAST_OUTPUT_DIR/metadata.txt"
 
             - name: Collect DAST evidence
               if: always()
               shell: bash
               run: |
-                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
-                  mkdir -p "$EVIDENCE_DIR"
-
-                  docker logs dast-api \
-                    > "$EVIDENCE_DIR/application.log" 2>&1 || true
-
-                  docker logs dast-zap \
-                    > "$EVIDENCE_DIR/zap.log" 2>&1 || true
-
-                  docker rm -f dast-zap >/dev/null 2>&1 || true
-                  docker rm -f dast-api >/dev/null 2>&1 || true
+                  mkdir -p "$DAST_OUTPUT_DIR"
+                  docker logs dast-api > "$DAST_OUTPUT_DIR/application.log" 2>&1 || true
+                  docker logs dast-zap > "$DAST_OUTPUT_DIR/zap.log" 2>&1 || true
+                  docker rm -f dast-zap dast-api >/dev/null 2>&1 || true
                   docker image rm "$DAST_IMAGE" >/dev/null 2>&1 || true
 
             - name: Upload DAST evidence
