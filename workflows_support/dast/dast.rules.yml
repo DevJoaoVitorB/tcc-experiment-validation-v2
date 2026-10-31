@@ -1,43 +1,74 @@
-# OWASP ZAP Automation Framework — plano DAST compartilhado pelos grupos A e B.
-# A API e suas operações são descobertas pela especificação OpenAPI publicada em /openapi.json.
-# O plano não presume rotas funcionais além desse contrato de documentação.
-# Documentação: https://www.zaproxy.org/docs/desktop/addons/automation-framework/
+# OWASP ZAP Automation Framework
+# Plano DAST compartilhado pelos grupos A e B.
+# A API é descoberta por meio da especificação OpenAPI publicada em /openapi.json.
 
 env:
-  contexts:
-    - name: authentication-api
-      urls:
-        - http://host.docker.internal:3000
-      includePaths:
-        - 'http://host\.docker\.internal:3000/.*'
+    contexts:
+        - name: authentication-api
+          urls:
+              - http://host.docker.internal:3000
+          includePaths:
+              - 'http://host\.docker\.internal:3000/.*'
 
 jobs:
-  - type: openapi
-    parameters:
-      apiUrl: http://host.docker.internal:3000/openapi.json
-      context: authentication-api
-      targetUrl: http://host.docker.internal:3000
+    # Importa as operações documentadas pela própria API.
+    - type: openapi
+      parameters:
+          apiUrl: http://host.docker.internal:3000/openapi.json
+          context: authentication-api
+          targetUrl: http://host.docker.internal:3000
 
-  - type: passiveScan-wait
-    parameters:
-      maxDuration: 5
+    # Configura a análise passiva.
+    - type: passiveScan-config
+      parameters:
+          maxAlertsPerRule: 0
+          scanOnlyInScope: true
+          maxBodySizeInBytesToScan: 0
 
-  - type: activeScan-config
-    parameters:
-      maxScanDurationInMins: 15
-      maxRuleDurationInMins: 5
-      maxAlertsPerRule: 20
-      threadPerHost: 2
+    # Aguarda o processamento passivo das requisições importadas.
+    - type: passiveScan-wait
+      parameters:
+          maxDuration: 5
 
-  - type: activeScan
-    parameters:
-      context: authentication-api
-      threadPerHost: 2
-      maxAlertsPerRule: 20
-    policyDefinition:
-      defaultStrength: Medium
-      defaultThreshold: Medium
+    # Configura os limites da análise ativa.
+    - type: activeScan-config
+      parameters:
+          maxScanDurationInMins: 15
+          maxRuleDurationInMins: 5
+          maxAlertsPerRule: 0
+          threadPerHost: 2
 
-  - type: passiveScan-wait
-    parameters:
-      maxDuration: 5
+    # Executa a análise ativa sobre o contexto importado.
+    - type: activeScan
+      parameters:
+          context: authentication-api
+          threadPerHost: 2
+          maxAlertsPerRule: 0
+      policyDefinition:
+          defaultStrength: Medium
+          defaultThreshold: Medium
+
+    # Aguarda o processamento passivo das requisições geradas pelo scanner.
+    - type: passiveScan-wait
+      parameters:
+          maxDuration: 5
+
+    # Gera o relatório original em JSON.
+    - type: report
+      parameters:
+          template: traditional-json
+          reportDir: /zap/out
+          reportFile: zap-report.json
+          reportTitle: OWASP ZAP DAST Report
+          reportDescription: DAST da API de Autenticação
+          displayReport: false
+
+    # Gera o relatório em HTML.
+    - type: report
+      parameters:
+          template: traditional-html
+          reportDir: /zap/out
+          reportFile: zap-report.html
+          reportTitle: OWASP ZAP DAST Report
+          reportDescription: DAST da API de Autenticação
+          displayReport: false

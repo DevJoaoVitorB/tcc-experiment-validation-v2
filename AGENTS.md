@@ -31,13 +31,11 @@ Execute as verificações e os testes pertinentes ao funcionamento da aplicaçã
 
 ## 7. Documentação da API
 
-Disponibilize a especificação da API em formato OpenAPI JSON, acessível durante a execução da aplicação pelo caminho `/openapi.json`, para permitir seu consumo automatizado por pipelines de CI/CD.
+A especificação OpenAPI deve representar fielmente a API implementada, contemplando todas as operações disponibilizadas, seus respectivos caminhos, métodos HTTP, parâmetros, dados de entrada, estruturas de resposta e códigos de status correspondentes.
 
-A especificação deve contemplar as rotas implementadas, os métodos HTTP, os parâmetros, os dados de entrada e saída e as respostas correspondentes ao comportamento implementado.
+A documentação deve permanecer consistente com o comportamento efetivamente implementado, sem omitir operações ou descrever funcionalidades inexistentes.
 
-Mantenha a especificação consistente com a implementação, atualizando-a quando houver alterações nos elementos documentados.
-
-A implementação poderá utilizar qualquer mecanismo compatível com esses requisitos, sem impor uma biblioteca específica ou uma estrutura de arquivos predeterminada para isso.
+A geração da especificação deve respeitar a liberdade de escolha da arquitetura, organização interna, nomenclatura e mecanismos de implementação, não sendo exigida a utilização de biblioteca ou estrutura específica.
 
 ## 8. Escopo
 
