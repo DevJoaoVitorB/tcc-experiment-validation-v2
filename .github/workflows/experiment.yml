@@ -683,53 +683,20 @@ jobs:
               run: |
                   set -euo pipefail
 
-                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
                   ZAP_API="$ZAP_API_URL"
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
 
                   mkdir -p "$EVIDENCE_DIR"
 
-                  # /zap/out está montado diretamente em evidence/dast.
-                  for template in traditional-json traditional-html; do
-                    case "$template" in
-                      traditional-json) filename=zap-report.json ;;
-                      traditional-html) filename=zap-report.html ;;
-                    esac
+                  curl -sS -G \
+                    -o "$EVIDENCE_DIR/zap-diagnostic.json" \
+                    -w "HTTP status: %{http_code}\n" \
+                    "$ZAP_API/JSON/reports/action/generate/" \
+                    --data-urlencode "apikey=$DAST_ZAP_API_KEY" \
+                    --data-urlencode "title=DAST - Authentication API" \
+                    --data-urlencode "template=traditional-json"
 
-                    response_file="$EVIDENCE_DIR/${filename}.response"
-
-                    http_code=$(curl -sS -G \
-                      -o "$response_file" \
-                      -w "%{http_code}" \
-                      "$ZAP_API/JSON/reports/action/generate/" \
-                      --data-urlencode "apikey=$DAST_ZAP_API_KEY" \
-                      --data-urlencode "title=DAST - Authentication API" \
-                      --data-urlencode "template=$template" \
-                      --data-urlencode "description=Alertas do ZAP e testes comportamentais da API de autenticação." \
-                      --data-urlencode "reportFileName=$filename" \
-                      --data-urlencode "reportDir=/zap/out" \
-                      --data-urlencode "display=false")
-
-                    echo "HTTP status ($filename): $http_code"
-
-                    if [ "$http_code" != "200" ]; then
-                      echo "::error::Falha na geração de $filename."
-                      cat "$response_file"
-                      exit 1
-                    fi
-
-                    cat "$response_file" \
-                      >> "$EVIDENCE_DIR/report-generation.jsonl"
-
-                    if [ ! -s "$EVIDENCE_DIR/$filename" ]; then
-                      echo "::error::O ZAP não gerou $filename no diretório de evidências."
-                      exit 1
-                    fi
-                  done
-
-                  jq -e . "$EVIDENCE_DIR/zap-report.json" >/dev/null
-
-                  echo "zap_reports_generated=true" \
-                    >> "$EVIDENCE_DIR/metadata.txt"
+                  cat "$EVIDENCE_DIR/zap-diagnostic.json"
 
             - name: Collect DAST evidence
               if: always()
