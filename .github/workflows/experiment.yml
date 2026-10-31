@@ -352,11 +352,19 @@ jobs:
         env:
             JWT_ACCESS_SECRET: 'dast-test-access-secret-CHANGE-ME-123456789'
             JWT_REFRESH_SECRET: 'dast-test-refresh-secret-CHANGE-ME-123456789'
+
             DAST_CONFIG_DIR: workflows_support/dast
             DAST_PLAN: workflows_support/dast/dast.rules.yml
+
+            # Endereço utilizado pelo runner do GitHub Actions.
             DAST_BASE_URL: http://127.0.0.1:3000
+
+            # Endereço utilizado pelo ZAP dentro do container Docker.
+            ZAP_BASE_URL: http://host.docker.internal:3000
+
             ZAP_API_URL: http://127.0.0.1:8080
             ZAP_PROXY_URL: http://127.0.0.1:8080
+
             DAST_OUTPUT_DIR: evidence/dast
             DAST_IMAGE: authentication-api:dast-${{ inputs.experiment_group }}
             EVIDENCE_DIR: evidence/dast
@@ -369,6 +377,7 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
+
                   EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
                   mkdir -p "$EVIDENCE_DIR"
 
@@ -381,6 +390,7 @@ jobs:
                     echo "zap_image=zaproxy/zap-stable"
                     echo "dast_image=$DAST_IMAGE"
                     echo "dast_base_url=$DAST_BASE_URL"
+                    echo "zap_base_url=$ZAP_BASE_URL"
                   } > "$EVIDENCE_DIR/metadata.txt"
 
             - name: Build application Docker image
@@ -388,6 +398,7 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
+
                   EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
 
                   set +e
@@ -398,6 +409,7 @@ jobs:
 
                   echo "docker_build_exit_code=$status" \
                     >> "$EVIDENCE_DIR/metadata.txt"
+
                   exit "$status"
 
             - name: Start application
@@ -405,6 +417,7 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
+
                   EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
 
                   docker run -d \
@@ -422,6 +435,7 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
+
                   EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
                   ready=false
 
@@ -459,10 +473,11 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
+
                   EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
 
                   PLAN="$GITHUB_WORKSPACE/$DAST_PLAN"
-                  SCRIPT="$GITHUB_WORKSPACE/$DAST_CONFIG_DIR/dast.script.cjs"
+                  SCRIPT="$GITHUB_WORKSPACE/$DAST_CONFIG_DIR/dast.script.js"
 
                   if [ ! -s "$PLAN" ]; then
                     echo "::error::Plano DAST ausente ou vazio: $PLAN"
@@ -486,7 +501,7 @@ jobs:
                     (.paths | type == "object") and
                     (.paths | length > 0)
                   ' "$EVIDENCE_DIR/openapi.json" >/dev/null; then
-                    echo "::error::O documento OpenAPI está inválido ou não contém rotas."
+                    echo "::error::Documento OpenAPI inválido ou sem rotas."
                     exit 1
                   fi
 
@@ -510,9 +525,9 @@ jobs:
                   DAST_ZAP_API_KEY=$(openssl rand -hex 32)
 
                   mkdir -p "$EVIDENCE_DIR"
+
                   echo "DAST_ZAP_API_KEY=$DAST_ZAP_API_KEY" >> "$GITHUB_ENV"
 
-                  # Inicia o ZAP em daemon e mantém o container ativo.
                   docker run -d \
                     --name dast-zap \
                     --add-host=host.docker.internal:host-gateway \
@@ -527,7 +542,6 @@ jobs:
                       -config "api.addrs.addr.name=.*" \
                       -config "api.addrs.addr.regex=true"
 
-                  # Aguarda a inicialização da API.
                   ready=false
 
                   for attempt in $(seq 1 90); do
@@ -551,7 +565,7 @@ jobs:
                   done
 
                   if [ "$ready" != "true" ]; then
-                    echo "::error::OWASP ZAP não ficou disponível após 180 segundos."
+                    echo "::error::OWASP ZAP não ficou disponível."
                     docker logs dast-zap --tail 150 \
                       > "$EVIDENCE_DIR/zap-startup-error.log" 2>&1 || true
                     cat "$EVIDENCE_DIR/zap-startup-error.log"
@@ -563,7 +577,6 @@ jobs:
                   echo "zap_version=$(jq -r '.version' "$EVIDENCE_DIR/zap-version.json")" \
                     >> "$EVIDENCE_DIR/metadata.txt"
 
-                  # Executa o Automation Framework.
                   if ! curl -fsS --connect-timeout 5 --max-time 30 -G \
                     "$ZAP_API/JSON/automation/action/runPlan/" \
                     --data-urlencode "apikey=$DAST_ZAP_API_KEY" \
@@ -585,8 +598,6 @@ jobs:
 
                   echo "zap_plan_id=$plan_id" >> "$EVIDENCE_DIR/metadata.txt"
 
-                  # Acompanha a execução pelo campo "finished" retornado pelo ZAP.
-                  # O progresso não utiliza status COMPLETED/FAILED.
                   completed=false
 
                   for attempt in $(seq 1 900); do
@@ -603,11 +614,6 @@ jobs:
                       --data-urlencode "planId=$plan_id" \
                       -o "$EVIDENCE_DIR/zap-plan-progress.json" \
                       2>/dev/null; then
-
-                      if [ "$attempt" -eq 1 ] || [ $((attempt % 15)) -eq 0 ]; then
-                        echo "Consulta de progresso: $attempt"
-                        jq '.' "$EVIDENCE_DIR/zap-plan-progress.json" || true
-                      fi
 
                       finished=$(jq -r '.finished // empty' \
                         "$EVIDENCE_DIR/zap-plan-progress.json")
@@ -650,10 +656,17 @@ jobs:
                   DAST_OUTPUT_DIR: ${{ env.DAST_OUTPUT_DIR }}
               run: |
                   set -euo pipefail
+
                   EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
 
-                  node --check "$DAST_CONFIG_DIR/dast.script.cjs"
-                  node "$DAST_CONFIG_DIR/dast.script.cjs" \
+                  # O projeto utiliza type: module.
+                  # A cópia .cjs preserva o script CommonJS sem alterar package.json.
+                  cp "$DAST_CONFIG_DIR/dast.script.js" \
+                    "$EVIDENCE_DIR/dast.script.cjs"
+
+                  node --check "$EVIDENCE_DIR/dast.script.cjs"
+
+                  node "$EVIDENCE_DIR/dast.script.cjs" \
                     2>&1 | tee "$EVIDENCE_DIR/dast-script.log"
 
                   if [ ! -s "$EVIDENCE_DIR/dast-tests.json" ]; then
@@ -669,16 +682,20 @@ jobs:
               shell: bash
               run: |
                   set -euo pipefail
+
                   EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
                   ZAP_API="$ZAP_API_URL"
 
+                  mkdir -p "$EVIDENCE_DIR"
+
+                  # /zap/out está montado diretamente em evidence/dast.
                   for template in traditional-json traditional-html; do
                     case "$template" in
                       traditional-json) filename=zap-report.json ;;
                       traditional-html) filename=zap-report.html ;;
                     esac
 
-                    response_file="$EVIDENCE_DIR/zap-report-response.json"
+                    response_file="$EVIDENCE_DIR/${filename}.response"
 
                     http_code=$(curl -sS -G \
                       -o "$response_file" \
@@ -686,31 +703,34 @@ jobs:
                       "$ZAP_API/JSON/reports/action/generate/" \
                       --data-urlencode "apikey=$DAST_ZAP_API_KEY" \
                       --data-urlencode "title=DAST - Authentication API" \
-                      --data-urlencode "template=traditional-json" \
-                      --data-urlencode "description=Relatório DAST da API de autenticação." \
+                      --data-urlencode "template=$template" \
+                      --data-urlencode "description=Alertas do ZAP e testes comportamentais da API de autenticação." \
                       --data-urlencode "sites=$ZAP_BASE_URL" \
-                      --data-urlencode "reportFileName=zap-report.json" \
+                      --data-urlencode "reportFileName=$filename" \
                       --data-urlencode "reportDir=/zap/out" \
                       --data-urlencode "display=false")
 
-                    echo "HTTP status: $http_code"
-                    cat "$response_file"
+                    echo "HTTP status ($filename): $http_code"
 
                     if [ "$http_code" != "200" ]; then
-                      echo "::error::Falha na geração do relatório JSON do ZAP."
+                      echo "::error::Falha na geração de $filename."
+                      cat "$response_file"
                       exit 1
                     fi
 
-                    echo "$response" >> "$EVIDENCE_DIR/report-generation.jsonl"
+                    cat "$response_file" \
+                      >> "$EVIDENCE_DIR/report-generation.jsonl"
 
                     if [ ! -s "$EVIDENCE_DIR/$filename" ]; then
-                      echo "::error::O ZAP não gerou $filename."
+                      echo "::error::O ZAP não gerou $filename no diretório de evidências."
                       exit 1
                     fi
                   done
 
                   jq -e . "$EVIDENCE_DIR/zap-report.json" >/dev/null
-                  echo "zap_reports_generated=true" >> "$EVIDENCE_DIR/metadata.txt"
+
+                  echo "zap_reports_generated=true" \
+                    >> "$EVIDENCE_DIR/metadata.txt"
 
             - name: Collect DAST evidence
               if: always()
