@@ -1,16 +1,24 @@
+
 # Plano DAST do OWASP ZAP para a API de autenticação.
 #
-# O relatório reúne os alertas do Active Scan/Passive Scan e os alertas levantados
-# pelo script de análise comportamental. O script registra achados por meio da API
-# de alertas do ZAP; por isso, eles usam a mesma escala de risco e aparecem no
-# relatório JSON/HTML padrão, sem uma categoria de relatório separada.
+# Este plano realiza a análise dinâmica padrão da API.
+# Os testes comportamentais são executados separadamente e seus
+# achados serão posteriormente integrados à instância do ZAP.
+#
+# A geração dos relatórios consolidados ocorre após as duas análises.
 #
 # Documentação oficial:
-# Automation Framework: https://www.zaproxy.org/docs/desktop/addons/automation-framework/
-# OpenAPI: https://www.zaproxy.org/docs/desktop/addons/openapi-support/automation/
-# Active Scan: https://www.zaproxy.org/docs/desktop/addons/automation-framework/job-ascan/
-# Script Scan Rules: https://www.zaproxy.org/docs/desktop/addons/script-console/scanrules/
-# Limitação do Active Scan para falhas lógicas de autorização: https://www.zaproxy.org/docs/desktop/start/features/ascan/
+# Automation Framework:
+# https://www.zaproxy.org/docs/desktop/addons/automation-framework/
+#
+# OpenAPI:
+# https://www.zaproxy.org/docs/desktop/addons/openapi-support/automation/
+#
+# Active Scan:
+# https://www.zaproxy.org/docs/desktop/addons/automation-framework/job-ascan/
+#
+# Limitação do Active Scan para falhas lógicas de autorização:
+# https://www.zaproxy.org/docs/desktop/start/features/ascan/
 
 env:
     contexts:
@@ -19,34 +27,26 @@ env:
               - http://127.0.0.1:3000
           includePaths:
               - 'http://127\.0\.0\.1:3000/.*'
+
     vars:
         baseUrl: http://127.0.0.1:3000
 
 jobs:
-    # Script de testes extras
-    - type: script
-      parameters:
-          action: add
-          type: active
-          engine: 'ECMAScript : Graal.js'
-          name: dast-script
-          source: dast.script.js
-
-    # Confirma que a API está disponível antes de importar e testar.
+    # Confirma que a API está disponível antes da análise.
     - type: requestor
       requests:
           - url: http://127.0.0.1:3000/health
             name: Verificar disponibilidade da API
             method: GET
 
-    # Importa endpoints documentados.
+    # Importa os endpoints documentados na especificação OpenAPI.
     - type: openapi
       parameters:
           apiUrl: http://127.0.0.1:3000/openapi.json
           context: authentication-api
           targetUrl: http://127.0.0.1:3000
 
-    # Configura limites do Active Scan.
+    # Configura os limites de execução do Active Scan.
     - type: activeScan-config
       parameters:
           maxScanDurationInMins: 15
@@ -54,7 +54,7 @@ jobs:
           maxAlertsPerRule: 20
           threadPerHost: 2
 
-    # Análise padrão do ZAP sobre os endpoints importados para o contexto.
+    # Executa a análise dinâmica padrão nos endpoints importados.
     - type: activeScan
       parameters:
           context: authentication-api
@@ -65,24 +65,7 @@ jobs:
           defaultStrength: Medium
           defaultThreshold: Medium
 
-    # Espera que a análise passiva termine antes de gerar os relatórios.
+    # Aguarda a conclusão da análise passiva.
     - type: passiveScan-wait
       parameters:
           maxDuration: 5
-
-    # Gerar os arquivos de análise
-    - type: report
-      parameters:
-          template: traditional-json
-          reportDir: /zap/out
-          reportFile: zap-report.json
-          reportTitle: 'DAST - Authentication API'
-          reportDescription: 'Alertas consolidados da análise DAST do OWASP ZAP, incluindo as verificações comportamentais da API.'
-
-    - type: report
-      parameters:
-          template: traditional-html
-          reportDir: /zap/out
-          reportFile: zap-report.html
-          reportTitle: 'DAST - Authentication API'
-          reportDescription: 'Alertas consolidados da análise DAST do OWASP ZAP, incluindo as verificações comportamentais da API.'

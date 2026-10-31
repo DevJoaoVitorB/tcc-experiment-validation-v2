@@ -355,6 +355,9 @@ jobs:
             DAST_CONFIG_DIR: workflows_support/dast
             DAST_PLAN: workflows_support/dast/dast.rules.yml
             DAST_BASE_URL: http://127.0.0.1:3000
+            ZAP_API_URL: http://127.0.0.1:8080
+            ZAP_PROXY_URL: http://127.0.0.1:8080
+            DAST_OUTPUT_DIR: evidence/dast
             DAST_IMAGE: authentication-api:dast-${{ inputs.experiment_group }}
             EVIDENCE_DIR: evidence/dast
 
@@ -490,181 +493,156 @@ jobs:
                   echo "Plano DAST, script e OpenAPI validados." \
                     | tee "$EVIDENCE_DIR/config-validation.txt"
 
-            - name: Run OWASP ZAP
+            - name: Setup Node.js for behavioral DAST
+              uses: actions/setup-node@v4
+              with:
+                  node-version: '22.14.0'
+
+            - name: Run OWASP ZAP Automation Plan
               id: zap
               shell: bash
               run: |
-                  set -uo pipefail
+                  set -euo pipefail
 
-                  EVIDENCE_DIR="$GITHUB_WORKSPACE/evidence/dast"
-                  mkdir -p "$EVIDENCE_DIR"
-                  export EVIDENCE_DIR
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+                  ZAP_API="$ZAP_API_URL"
+                  PLAN_PATH="/zap/wrk/$DAST_PLAN"
+                  DAST_ZAP_API_KEY=$(openssl rand -hex 32)
 
-                  chmod -R a+rwX "$EVIDENCE_DIR"
+                  # Compartilha a chave temporária com os próximos steps.
+                  echo "DAST_ZAP_API_KEY=$DAST_ZAP_API_KEY" >> "$GITHUB_ENV"
 
-                  set +e
-                  docker run --rm \
-                    --network host \
+                  # O container permanece ativo até Collect DAST evidence.
+                  docker run -d \
+                    --name dast-zap \
+                    --publish 8080:8080 \
                     --volume "$GITHUB_WORKSPACE:/zap/wrk:ro" \
                     --volume "$EVIDENCE_DIR:/zap/out:rw" \
                     zaproxy/zap-stable \
-                    zap.sh -cmd \
-                      -autorun "/zap/wrk/$DAST_PLAN" \
-                    2>&1 | tee "$EVIDENCE_DIR/zap.log"
+                    zap.sh -daemon \
+                      -host 0.0.0.0 \
+                      -port 8080 \
+                      -config "api.key=$DAST_ZAP_API_KEY" \
+                      -config "api.addrs.addr.name=.*" \
+                      -config "api.addrs.addr.regex=true"
 
-                  status=${PIPESTATUS[0]}
-                  set -e
-
-                  # Corrige permissões dos arquivos criados pelo container do ZAP.
-                  sudo chown -R "$(id -u):$(id -g)" "$EVIDENCE_DIR"
-                  sudo chmod -R u+rwX "$EVIDENCE_DIR"
-
-                  echo "zap_exit_code=$status" \
-                    >> "$EVIDENCE_DIR/metadata.txt"
-
-                  # Gera o resumo estruturado da suíte complementar.
-                  node <<'NODE'
-                  const fs = require('fs');
-                  const path = require('path');
-
-                  const dir = process.env.EVIDENCE_DIR;
-
-                  if (!dir || !path.isAbsolute(dir)) {
-                    throw new Error(
-                      'EVIDENCE_DIR deve conter um caminho absoluto.'
-                    );
-                  }
-
-                  fs.mkdirSync(dir, { recursive: true });
-
-                  const logPath = path.join(dir, 'zap.log');
-                  const outputPath = path.join(dir, 'dast-tests.json');
-
-                  const log = fs.existsSync(logPath)
-                    ? fs.readFileSync(logPath, 'utf8')
-                    : '';
-
-                  const tests = [];
-                  const counts = {
-                    PASS: 0,
-                    FAIL: 0,
-                    NOT_EVALUATED: 0,
-                    ERROR: 0
-                  };
-
-                  const pattern =
-                    /^\[DAST\]\s+(.+?)\s+=>\s+(PASS|FAIL|NOT_EVALUATED|ERROR)\b([^\r\n]*)/gm;
-
-                  for (const match of log.matchAll(pattern)) {
-                    const name = match[1].trim();
-                    const status = match[2];
-                    const detail = match[3].replace(/^;\s*/, '').trim();
-
-                    tests.push({ name, status, detail });
-                    counts[status]++;
-                  }
-
-                  const infraErrors = [
-                    ...log.matchAll(
-                      /^\[DAST\]\s+INFRA_ERROR:\s*(.*)$/gm
-                    )
-                  ];
-
-                  for (const match of infraErrors) {
-                    tests.push({
-                      name: 'Execução da suíte complementar',
-                      status: 'ERROR',
-                      detail: match[1].trim()
-                    });
-                    counts.ERROR++;
-                  }
-
-                  const completed =
-                    tests.length > 0 &&
-                    counts.ERROR === 0 &&
-                    counts.NOT_EVALUATED === 0 &&
-                    infraErrors.length === 0;
-
-                  const report = {
-                    schemaVersion: 1,
-                    completed,
-                    total: tests.length,
-                    counts,
-                    tests
-                  };
-
-                  fs.writeFileSync(
-                    outputPath,
-                    JSON.stringify(report, null, 2) + '\n'
-                  );
-
-                  console.log(
-                    `Testes complementares: total=${report.total}, ` +
-                    `PASS=${counts.PASS}, FAIL=${counts.FAIL}, ` +
-                    `NOT_EVALUATED=${counts.NOT_EVALUATED}, ERROR=${counts.ERROR}`
-                  );
-                  NODE
-
-                  echo "dast_tests_total=$(jq -r '.total' "$EVIDENCE_DIR/dast-tests.json")" \
-                    >> "$EVIDENCE_DIR/metadata.txt"
-                  echo "dast_tests_pass=$(jq -r '.counts.PASS' "$EVIDENCE_DIR/dast-tests.json")" \
-                    >> "$EVIDENCE_DIR/metadata.txt"
-                  echo "dast_tests_fail=$(jq -r '.counts.FAIL' "$EVIDENCE_DIR/dast-tests.json")" \
-                    >> "$EVIDENCE_DIR/metadata.txt"
-                  echo "dast_tests_not_evaluated=$(jq -r '.counts.NOT_EVALUATED' "$EVIDENCE_DIR/dast-tests.json")" \
-                    >> "$EVIDENCE_DIR/metadata.txt"
-                  echo "dast_tests_error=$(jq -r '.counts.ERROR' "$EVIDENCE_DIR/dast-tests.json")" \
-                    >> "$EVIDENCE_DIR/metadata.txt"
-
-                  # Valida os relatórios gerados pelo ZAP.
-                  validation_error=0
-
-                  for report in zap-report.json zap-report.html; do
-                    if [ ! -s "$EVIDENCE_DIR/$report" ]; then
-                      echo "Relatório ausente ou vazio: $report" \
-                        | tee -a "$EVIDENCE_DIR/error.txt"
-                      validation_error=1
+                  ready=false
+                  for attempt in $(seq 1 60); do
+                    if curl -fsS -G \
+                      "$ZAP_API/JSON/core/view/version/" \
+                      --data-urlencode "apikey=$DAST_ZAP_API_KEY" \
+                      -o "$EVIDENCE_DIR/zap-version.json"; then
+                      ready=true
+                      break
                     fi
+                    sleep 2
                   done
 
-                  if [ -s "$EVIDENCE_DIR/zap-report.json" ] &&
-                    ! jq -e '
-                      (.site | type == "array") and
-                      (.site | length > 0) and
-                      all(.site[]; (.alerts | type == "array"))
-                    ' "$EVIDENCE_DIR/zap-report.json" >/dev/null; then
-                    echo "Relatório JSON do ZAP inválido." \
-                      | tee -a "$EVIDENCE_DIR/error.txt"
-                    validation_error=1
-                  fi
-
-                  if ! jq -e '
-                    (.schemaVersion == 1) and
-                    (.completed == true) and
-                    (.total > 0) and
-                    (.counts | type == "object") and
-                    (.tests | type == "array") and
-                    ((.tests | length) == .total)
-                  ' "$EVIDENCE_DIR/dast-tests.json" >/dev/null; then
-                    echo "A suíte complementar está incompleta ou inconclusiva." \
-                      | tee -a "$EVIDENCE_DIR/error.txt"
-                    validation_error=1
-                  fi
-
-                  if [ "$status" -ne 0 ]; then
-                    echo "Falha na execução do OWASP ZAP (código $status)." \
-                      | tee -a "$EVIDENCE_DIR/error.txt"
-                    exit "$status"
-                  fi
-
-                  if [ "$validation_error" -ne 0 ]; then
+                  if [ "$ready" != "true" ]; then
+                    echo "::error::OWASP ZAP não ficou disponível."
                     exit 1
                   fi
 
-                  echo "reports_validated=true" \
+                  echo "zap_version=$(jq -r '.version' "$EVIDENCE_DIR/zap-version.json")" \
                     >> "$EVIDENCE_DIR/metadata.txt"
-                  echo "dast_test_suite_validated=true" \
-                    >> "$EVIDENCE_DIR/metadata.txt"
+
+                  response=$(curl -fsS -G \
+                    "$ZAP_API/JSON/automation/action/runPlan/" \
+                    --data-urlencode "apikey=$DAST_ZAP_API_KEY" \
+                    --data-urlencode "filePath=$PLAN_PATH")
+
+                  echo "$response" > "$EVIDENCE_DIR/zap-plan-start.json"
+                  plan_id=$(echo "$response" | jq -r '.planId // empty')
+
+                  if [ -z "$plan_id" ]; then
+                    echo "::error::O ZAP não retornou um identificador do plano."
+                    exit 1
+                  fi
+
+                  echo "zap_plan_id=$plan_id" >> "$EVIDENCE_DIR/metadata.txt"
+                  completed=false
+
+                  for attempt in $(seq 1 900); do
+                    curl -fsS -G \
+                      "$ZAP_API/JSON/automation/view/planProgress/" \
+                      --data-urlencode "apikey=$DAST_ZAP_API_KEY" \
+                      --data-urlencode "planId=$plan_id" \
+                      -o "$EVIDENCE_DIR/zap-plan-progress.json"
+
+                    if jq -e '.. | objects | select(has("status")) | .status == "COMPLETED"' \
+                      "$EVIDENCE_DIR/zap-plan-progress.json" >/dev/null 2>&1; then
+                      completed=true
+                      break
+                    fi
+                    sleep 2
+                  done
+
+                  if [ "$completed" != "true" ]; then
+                    echo "::error::O plano DAST não foi confirmado como concluído."
+                    exit 1
+                  fi
+
+                  echo "zap_plan_completed=true" >> "$EVIDENCE_DIR/metadata.txt"
+
+            - name: Run behavioral DAST tests
+              id: behavioral_dast
+              shell: bash
+              env:
+                  DAST_BASE_URL: ${{ env.DAST_BASE_URL }}
+                  ZAP_API_URL: ${{ env.ZAP_API_URL }}
+                  ZAP_PROXY_URL: ${{ env.ZAP_PROXY_URL }}
+                  DAST_OUTPUT_DIR: ${{ env.DAST_OUTPUT_DIR }}
+              run: |
+                  set -euo pipefail
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+
+                  node --check "$DAST_CONFIG_DIR/dast.script.js"
+                  node "$DAST_CONFIG_DIR/dast.script.js" \
+                    2>&1 | tee "$EVIDENCE_DIR/dast-script.log"
+
+                  if [ ! -s "$EVIDENCE_DIR/dast-tests.json" ]; then
+                    echo "::error::O executor não gerou dast-tests.json."
+                    exit 1
+                  fi
+
+                  jq -e '.schemaVersion == 1 and (.tests | type == "array")' \
+                    "$EVIDENCE_DIR/dast-tests.json" >/dev/null
+
+            - name: Generate consolidated ZAP reports
+              id: zap_reports
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+                  ZAP_API="$ZAP_API_URL"
+
+                  for template in traditional-json traditional-html; do
+                    case "$template" in
+                      traditional-json) filename=zap-report.json ;;
+                      traditional-html) filename=zap-report.html ;;
+                    esac
+
+                    response=$(curl -fsS -G \
+                      "$ZAP_API/JSON/reports/action/generate/" \
+                      --data-urlencode "apikey=$DAST_ZAP_API_KEY" \
+                      --data-urlencode "title=DAST - Authentication API" \
+                      --data-urlencode "template=$template" \
+                      --data-urlencode "description=Alertas do ZAP e testes comportamentais da API de autenticação." \
+                      --data-urlencode "sites=$DAST_BASE_URL" \
+                      --data-urlencode "reportFileName=$filename" \
+                      --data-urlencode "reportDir=/zap/out" \
+                      --data-urlencode "display=false")
+
+                    echo "$response" >> "$EVIDENCE_DIR/report-generation.jsonl"
+
+                    if [ ! -s "$EVIDENCE_DIR/$filename" ]; then
+                      echo "::error::O ZAP não gerou $filename."
+                      exit 1
+                    fi
+                  done
+
+                  jq -e . "$EVIDENCE_DIR/zap-report.json" >/dev/null
+                  echo "zap_reports_generated=true" >> "$EVIDENCE_DIR/metadata.txt"
 
             - name: Collect DAST evidence
               if: always()
@@ -676,6 +654,10 @@ jobs:
                   docker logs dast-api \
                     > "$EVIDENCE_DIR/application.log" 2>&1 || true
 
+                  docker logs dast-zap \
+                    > "$EVIDENCE_DIR/zap.log" 2>&1 || true
+
+                  docker rm -f dast-zap >/dev/null 2>&1 || true
                   docker rm -f dast-api >/dev/null 2>&1 || true
                   docker image rm "$DAST_IMAGE" >/dev/null 2>&1 || true
 
