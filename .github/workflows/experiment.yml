@@ -462,7 +462,7 @@ jobs:
                   EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
 
                   PLAN="$GITHUB_WORKSPACE/$DAST_PLAN"
-                  SCRIPT="$GITHUB_WORKSPACE/$DAST_CONFIG_DIR/dast.script.js"
+                  SCRIPT="$GITHUB_WORKSPACE/$DAST_CONFIG_DIR/dast.script.cjs"
 
                   if [ ! -s "$PLAN" ]; then
                     echo "::error::Plano DAST ausente ou vazio: $PLAN"
@@ -652,8 +652,8 @@ jobs:
                   set -euo pipefail
                   EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
 
-                  node --check "$DAST_CONFIG_DIR/dast.script.js"
-                  node "$DAST_CONFIG_DIR/dast.script.js" \
+                  node --check "$DAST_CONFIG_DIR/dast.script.cjs"
+                  node "$DAST_CONFIG_DIR/dast.script.cjs" \
                     2>&1 | tee "$EVIDENCE_DIR/dast-script.log"
 
                   if [ ! -s "$EVIDENCE_DIR/dast-tests.json" ]; then
