@@ -455,15 +455,48 @@ jobs:
                     (.components.securitySchemes // {}) | length
                   ' "$EVIDENCE_DIR/openapi.json")
 
+                  # Conta operações com segurança efetiva declarada.
+                  # A segurança definida na operação substitui a global.
+                  SECURED_OPERATION_COUNT=$(jq '
+                    . as $spec |
+                    [
+                      .paths[]? |
+                      to_entries[] |
+                      select(
+                        .key == "get" or
+                        .key == "post" or
+                        .key == "put" or
+                        .key == "patch" or
+                        .key == "delete" or
+                        .key == "options" or
+                        .key == "head" or
+                        .key == "trace"
+                      ) |
+                      select(
+                        if has("value") then
+                          if (.value | has("security")) then
+                            ((.value.security // []) | length) > 0
+                          else
+                            (($spec.security // []) | length) > 0
+                          end
+                        else
+                          false
+                        end
+                      )
+                    ] | length
+                  ' "$EVIDENCE_DIR/openapi.json")
+
                   {
                     echo "openapi_paths=$PATH_COUNT"
                     echo "openapi_operations=$OPERATION_COUNT"
                     echo "openapi_security_schemes=$SECURITY_SCHEMES_COUNT"
+                    echo "openapi_secured_operations=$SECURED_OPERATION_COUNT"
                   } >> "$EVIDENCE_DIR/metadata.txt"
 
                   echo "OpenAPI paths: $PATH_COUNT"
                   echo "OpenAPI operations: $OPERATION_COUNT"
                   echo "OpenAPI security schemes: $SECURITY_SCHEMES_COUNT"
+                  echo "OpenAPI secured operations: $SECURED_OPERATION_COUNT"
 
             - name: Run OWASP ZAP Automation Framework
               shell: bash
@@ -622,16 +655,16 @@ jobs:
                   # Verifica os relatórios gerados pelos jobs nativos.
                   REPORTS_OK=true
 
-                  if [ ! -s "$EVIDENCE_DIR/zap-report.json" ]; then
+                  if [ ! -s "$EVIDENCE_DIR/dast-report.json" ]; then
                     REPORTS_OK=false
                   fi
 
-                  if [ ! -s "$EVIDENCE_DIR/zap-report.html" ]; then
+                  if [ ! -s "$EVIDENCE_DIR/dast-report.html" ]; then
                     REPORTS_OK=false
                   fi
 
-                  if [ -s "$EVIDENCE_DIR/zap-report.json" ]; then
-                    jq -e . "$EVIDENCE_DIR/zap-report.json" \
+                  if [ -s "$EVIDENCE_DIR/dast-report.json" ]; then
+                    jq -e . "$EVIDENCE_DIR/dast-report.json" \
                       >/dev/null 2>&1 || REPORTS_OK=false
                   fi
 
@@ -664,8 +697,8 @@ jobs:
                   fi
 
                   # Calcula o hash do relatório original.
-                  sha256sum "$EVIDENCE_DIR/zap-report.json" \
-                    > "$EVIDENCE_DIR/report-sha256.txt"
+                  sha256sum "$EVIDENCE_DIR/dast-report.json" \
+                    > "$EVIDENCE_DIR/dast-report-sha256.txt"
 
             - name: Preserve DAST configuration and metadata
               if: always()
@@ -693,9 +726,9 @@ jobs:
                     cp "$DAST_PLAN" "$EVIDENCE_DIR/dast.rules.yml"
                   fi
 
-                  if [ -f "$EVIDENCE_DIR/zap-report.json" ]; then
-                    sha256sum "$EVIDENCE_DIR/zap-report.json" \
-                      > "$EVIDENCE_DIR/report-sha256.txt"
+                  if [ -f "$EVIDENCE_DIR/dast-report.json" ]; then
+                    sha256sum "$EVIDENCE_DIR/dast-report.json" \
+                      > "$EVIDENCE_DIR/dast-report-sha256.txt"
                   fi
 
             - name: Collect DAST evidence
@@ -791,8 +824,7 @@ jobs:
                   copy_report "$(find_report semgrep-report.json)" sast-report.json
                   copy_report "$(find_report npm-audit-all.json)" sca-all-report.json
                   copy_report "$(find_report npm-audit-production.json)" sca-production-report.json
-                  copy_report "$(find_report zap-report.json)" dast-zap-report.json
-                  copy_report "$(find_report dast-tests.json)" dast-tests.json
+                  copy_report "$(find_report dast-report.json)" dast-report.json
 
                   {
                     echo "# Relatório consolidado de segurança"
@@ -852,18 +884,33 @@ jobs:
                         jq -e '.metadata.vulnerabilities | type == "object"' \
                           "$REPORTS/$file" >/dev/null 2>&1; then
 
-                        jq -r '
-                          "| Severidade original | Quantidade |",
-                          "|---|---:|",
-                          "| Critical | \(.metadata.vulnerabilities.critical // 0) |",
-                          "| High | \(.metadata.vulnerabilities.high // 0) |",
-                          "| Moderate | \(.metadata.vulnerabilities.moderate // 0) |",
-                          "| Low | \(.metadata.vulnerabilities.low // 0) |",
-                          "| Info | \(.metadata.vulnerabilities.info // 0) |",
-                          "| Total reportado | \(.metadata.vulnerabilities.total // 0) |",
-                          "",
-                          "Dependências analisadas: \(.metadata.dependencies.total // 0)"
-                        ' "$REPORTS/$file"
+                        if [ "$file" = "sca-production-report.json" ]; then
+                          jq -r '
+                            "| Severidade original | Quantidade |",
+                            "|---|---:|",
+                            "| Critical | \(.metadata.vulnerabilities.critical // 0) |",
+                            "| High | \(.metadata.vulnerabilities.high // 0) |",
+                            "| Moderate | \(.metadata.vulnerabilities.moderate // 0) |",
+                            "| Low | \(.metadata.vulnerabilities.low // 0) |",
+                            "| Info | \(.metadata.vulnerabilities.info // 0) |",
+                            "| Total reportado | \(.metadata.vulnerabilities.total // 0) |",
+                            "",
+                            "Dependências de produção analisadas: \(.metadata.dependencies.prod // 0)"
+                          ' "$REPORTS/$file"
+                        else
+                          jq -r '
+                            "| Severidade original | Quantidade |",
+                            "|---|---:|",
+                            "| Critical | \(.metadata.vulnerabilities.critical // 0) |",
+                            "| High | \(.metadata.vulnerabilities.high // 0) |",
+                            "| Moderate | \(.metadata.vulnerabilities.moderate // 0) |",
+                            "| Low | \(.metadata.vulnerabilities.low // 0) |",
+                            "| Info | \(.metadata.vulnerabilities.info // 0) |",
+                            "| Total reportado | \(.metadata.vulnerabilities.total // 0) |",
+                            "",
+                            "Dependências analisadas: \(.metadata.dependencies.total // 0)"
+                          ' "$REPORTS/$file"
+                        fi
                       else
                         echo "Relatório ausente ou sem estrutura válida de vulnerabilidades."
                       fi
@@ -874,12 +921,12 @@ jobs:
                     echo "## DAST — OWASP ZAP"
                     echo
 
-                    if [ -s "$REPORTS/dast-zap-report.json" ] &&
+                    if [ -s "$REPORTS/dast-report.json" ] &&
                       jq -e '
                         (.site | type == "array") and
                         (.site | length > 0) and
                         all(.site[]; (.alerts | type == "array"))
-                      ' "$REPORTS/dast-zap-report.json" >/dev/null 2>&1; then
+                      ' "$REPORTS/dast-report.json" >/dev/null 2>&1; then
 
                       jq -r '
                         [
@@ -901,39 +948,12 @@ jobs:
                           "| \($severity) | \([$severities[] | select(. == $severity)] | length) |"
                         ),
                         "| **Total** | **\($severities | length)** |"
-                      ' "$REPORTS/dast-zap-report.json"
+                      ' "$REPORTS/dast-report.json"
 
                       echo
-                      echo "Os totais correspondem aos alertas registrados no JSON original do ZAP. Os resultados dos testes complementares são apresentados separadamente."
+                      echo "Os totais correspondem aos alertas registrados no JSON original do ZAP."
                     else
                       echo "Relatório DAST ausente ou inválido; não foi possível determinar os totais."
-                    fi
-
-                    echo
-                    echo "## Execução dos testes complementares DAST"
-                    echo
-
-                    if [ -s "$REPORTS/dast-tests.json" ] &&
-                      jq -e '
-                        (.schemaVersion == 1) and
-                        (.counts | type == "object") and
-                        (.tests | type == "array") and
-                        ((.tests | length) == .total)
-                      ' "$REPORTS/dast-tests.json" >/dev/null 2>&1; then
-
-                      jq -r '
-                        "| Resultado | Quantidade |",
-                        "|---|---:|",
-                        "| PASS | \(.counts.PASS // 0) |",
-                        "| FAIL | \(.counts.FAIL // 0) |",
-                        "| NOT_EVALUATED | \(.counts.NOT_EVALUATED // 0) |",
-                        "| ERROR | \(.counts.ERROR // 0) |",
-                        "| Total de resultados | \(.total) |",
-                        "",
-                        "Conclusão da suíte: \(if .completed == true and (.counts.ERROR // 0) == 0 and (.counts.NOT_EVALUATED // 0) == 0 then "completa" else "inconclusiva" end)."
-                      ' "$REPORTS/dast-tests.json"
-                    else
-                      echo "Resumo ausente ou inválido. Não foi possível comprovar a execução da suíte complementar."
                     fi
 
                     echo
@@ -944,7 +964,7 @@ jobs:
                     echo "- No SAST, os achados são contabilizados conforme os resultados presentes no JSON do Semgrep."
                     echo "- No SCA, os totais são os reportados pelo npm audit. Os relatórios de todas as dependências e de produção possuem escopos distintos e não devem ser somados."
                     echo "- No DAST, a tabela de severidade considera os alertas presentes no relatório JSON original do ZAP."
-                    echo "- PASS, FAIL, NOT_EVALUATED e ERROR são estados de execução dos testes complementares e não são somados aos alertas por severidade."
+                    echo "- A varredura DAST não comprova, por si só, a cobertura de operações autenticadas ou de autorização entre usuários."
                     echo "- A ausência de um relatório não significa ausência de vulnerabilidades."
                     echo "- A existência de um relatório, isoladamente, não comprova que a análise foi concluída com sucesso."
                     echo "- Os relatórios JSON originais são preservados para auditoria."

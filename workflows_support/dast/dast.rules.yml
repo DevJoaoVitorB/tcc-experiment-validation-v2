@@ -8,7 +8,8 @@
 # 4. Executar análise passiva e ativa sobre o contexto descoberto.
 # 5. Gerar relatórios JSON e HTML.
 #
-# A cobertura autenticada é uma tentativa adaptativa, não uma garantia.
+# A identificação automática de autenticação é uma tentativa adaptativa.
+# Sem usuários e credenciais configurados, não há garantia de varredura autenticada.
 # Nenhuma rota, campo de credencial ou formato de token é presumido.
 
 env:
@@ -41,8 +42,8 @@ jobs:
           threadCount: 2
 
     # Configura a análise passiva.
-    # Inclui a identificação de requisições de autenticação pelo
-    # Authentication Helper, quando padrões reconhecidos forem observados.
+    # Inclui a identificação de requisições de autenticação quando
+    # padrões reconhecidos forem observados.
     - type: passiveScan-config
       parameters:
           maxAlertsPerRule: 0
@@ -64,8 +65,8 @@ jobs:
           threadPerHost: 2
 
     # Executa análise ativa sobre o contexto descoberto.
-    # Caso a autenticação seja identificada e configurada pelo ZAP,
-    # o contexto poderá utilizar esse mecanismo durante a análise.
+    # A autenticação somente será efetiva se o ZAP conseguir
+    # configurar o método e dispor dos elementos necessários.
     - type: activeScan
       parameters:
           context: authentication-api
@@ -86,7 +87,7 @@ jobs:
       parameters:
           template: traditional-json
           reportDir: /zap/out
-          reportFile: zap-report.json
+          reportFile: dast-report.json
           reportTitle: OWASP ZAP DAST Report
           reportDescription: DAST da API de Autenticação
           displayReport: false
@@ -96,7 +97,7 @@ jobs:
       parameters:
           template: traditional-html
           reportDir: /zap/out
-          reportFile: zap-report.html
+          reportFile: dast-report.html
           reportTitle: OWASP ZAP DAST Report
           reportDescription: DAST da API de Autenticação
           displayReport: false
