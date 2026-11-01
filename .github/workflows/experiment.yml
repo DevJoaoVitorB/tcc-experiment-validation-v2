@@ -897,7 +897,7 @@ jobs:
                     echo "## DAST — OWASP ZAP"
                     echo
 
-                    if [ -f "$REPORTS/dast-report.json" ]; then
+                    if [ -s "$REPORTS/dast-report.json" ]; then
                       jq -r '
                         [
                           .site[]?.alerts[]? as $alert
@@ -919,9 +919,9 @@ jobs:
                           "| \($severity) | \([$severities[] | select(. == $severity)] | length) |"
                         ),
                         "| **Total** | **\($severities | length)** |"
-                      ' "$REPORTS/dast-report.json" >> "$SUMMARY_FILE"
+                      ' "$REPORTS/dast-report.json"
                     else
-                      echo "Relatório DAST não encontrado." >> "$SUMMARY_FILE"
+                      echo "Relatório DAST não encontrado."
                     fi
 
                     echo
@@ -931,7 +931,7 @@ jobs:
                     echo "- As severidades são mantidas conforme a classificação original de cada ferramenta."
                     echo "- No SAST, os achados são contabilizados conforme os resultados presentes no JSON do Semgrep."
                     echo "- No SCA, os totais são os reportados pelo npm audit. Os relatórios de todas as dependências e de produção possuem escopos distintos e não devem ser somados."
-                    echo "- No DAST, a tabela de severidade considera os alertas presentes no relatório JSON original do ZAP."
+                    echo "- No DAST, a tabela de severidade considera as ocorrências individuais presentes nas instâncias do relatório JSON original do ZAP."
                     echo "- A varredura DAST não comprova, por si só, a cobertura de operações autenticadas ou de autorização entre usuários."
                     echo "- A ausência de um relatório não significa ausência de vulnerabilidades."
                     echo "- A existência de um relatório, isoladamente, não comprova que a análise foi concluída com sucesso."
