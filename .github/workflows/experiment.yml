@@ -466,19 +466,18 @@ jobs:
                   echo "OpenAPI security schemes: $SECURITY_SCHEMES_COUNT"
 
             - name: Run OWASP ZAP Automation Framework
-              id: zap
               shell: bash
               run: |
                   set -Eeuo pipefail
 
                   EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
 
-                  # Preserva o plano utilizado na execução.
-                  cp "$DAST_PLAN" "$EVIDENCE_DIR/dast.rules.yml"
-
-                  # Prepara as permissões para gravação dos relatórios.
+                  # Prepara o diretório de evidências.
                   mkdir -p "$EVIDENCE_DIR"
                   chmod 0777 "$EVIDENCE_DIR"
+
+                  # Preserva o plano utilizado na execução.
+                  cp "$DAST_PLAN" "$EVIDENCE_DIR/dast.rules.yml"
 
                   # Baixa a versão fixa do OWASP ZAP.
                   docker pull "$ZAP_IMAGE" \
@@ -500,7 +499,7 @@ jobs:
                     --add-host=host.docker.internal:host-gateway \
                     --publish 127.0.0.1:8080:8080 \
                     --volume "$GITHUB_WORKSPACE:/zap/wrk:ro" \
-                    --volume "$GITHUB_WORKSPACE/$EVIDENCE_DIR:/zap/out:rw" \
+                    --volume "$EVIDENCE_DIR:/zap/out:rw" \
                     "$ZAP_IMAGE" \
                     zap.sh -daemon \
                       -host 0.0.0.0 \
@@ -608,19 +607,16 @@ jobs:
                   PLAN_WARNINGS=$(jq '(.warn // []) | length' \
                     "$EVIDENCE_DIR/zap-plan-progress.json")
 
-                  jq -r '
-                    (.info // [])[]?
-                  ' "$EVIDENCE_DIR/zap-plan-progress.json" \
+                  jq -r '(.info // [])[]?' \
+                    "$EVIDENCE_DIR/zap-plan-progress.json" \
                     > "$EVIDENCE_DIR/zap-plan-info.log"
 
-                  jq -r '
-                    (.warn // [])[]?
-                  ' "$EVIDENCE_DIR/zap-plan-progress.json" \
+                  jq -r '(.warn // [])[]?' \
+                    "$EVIDENCE_DIR/zap-plan-progress.json" \
                     > "$EVIDENCE_DIR/zap-plan-warnings.log"
 
-                  jq -r '
-                    (.error // [])[]?
-                  ' "$EVIDENCE_DIR/zap-plan-progress.json" \
+                  jq -r '(.error // [])[]?' \
+                    "$EVIDENCE_DIR/zap-plan-progress.json" \
                     > "$EVIDENCE_DIR/zap-plan-errors.log"
 
                   # Verifica os relatórios gerados pelos jobs nativos.
