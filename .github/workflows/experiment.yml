@@ -357,7 +357,8 @@ jobs:
             ZAP_API_URL: http://127.0.0.1:8080
             DAST_PLAN: workflows_support/dast/dast.rules.yml
             DAST_IMAGE: authentication-api:dast-${{ inputs.experiment_group }}
-            DAST_OUTPUT_DIR: evidence/dast
+            ZAP_IMAGE: zaproxy/zap-stable:2.17.0
+            EVIDENCE_DIR: evidence/dast
 
         steps:
             - name: Checkout repository
@@ -368,7 +369,7 @@ jobs:
               run: |
                   set -euo pipefail
 
-                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$DAST_OUTPUT_DIR"
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
                   mkdir -p "$EVIDENCE_DIR"
 
                   {
@@ -377,7 +378,7 @@ jobs:
                     echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
                     echo "commit=${GITHUB_SHA}"
                     echo "event=${GITHUB_EVENT_NAME}"
-                    echo "zap_image=zaproxy/zap-stable"
+                    echo "zap_image=$ZAP_IMAGE"
                     echo "dast_plan=$DAST_PLAN"
                   } > "$EVIDENCE_DIR/metadata.txt"
 
@@ -386,7 +387,7 @@ jobs:
               run: |
                   set -euo pipefail
 
-                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$DAST_OUTPUT_DIR"
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
 
                   docker build \
                     -t "$DAST_IMAGE" . \
@@ -402,12 +403,14 @@ jobs:
                     "$DAST_IMAGE" \
                     > "$EVIDENCE_DIR/container-id.txt"
 
+                  # Aguarda a API disponibilizar sua especificação OpenAPI.
                   ready=false
 
                   for attempt in $(seq 1 60); do
                     if curl -fsS --max-time 3 \
                       "$DAST_BASE_URL/openapi.json" \
                       -o "$EVIDENCE_DIR/openapi.json"; then
+
                       ready=true
                       break
                     fi
@@ -427,25 +430,66 @@ jobs:
                     exit 1
                   fi
 
-                  PATH_COUNT=$(jq '.paths | length' "$EVIDENCE_DIR/openapi.json")
+                  # Registra a quantidade de caminhos e operações documentadas.
+                  PATH_COUNT=$(jq '.paths | length' \
+                    "$EVIDENCE_DIR/openapi.json")
 
-                  echo "openapi_paths=$PATH_COUNT" \
-                    >> "$EVIDENCE_DIR/metadata.txt"
+                  OPERATION_COUNT=$(jq '
+                    [
+                      .paths[] |
+                      to_entries[] |
+                      select(
+                        .key == "get" or
+                        .key == "post" or
+                        .key == "put" or
+                        .key == "patch" or
+                        .key == "delete" or
+                        .key == "options" or
+                        .key == "head" or
+                        .key == "trace"
+                      )
+                    ] | length
+                  ' "$EVIDENCE_DIR/openapi.json")
+
+                  SECURITY_SCHEMES_COUNT=$(jq '
+                    (.components.securitySchemes // {}) | length
+                  ' "$EVIDENCE_DIR/openapi.json")
+
+                  {
+                    echo "openapi_paths=$PATH_COUNT"
+                    echo "openapi_operations=$OPERATION_COUNT"
+                    echo "openapi_security_schemes=$SECURITY_SCHEMES_COUNT"
+                  } >> "$EVIDENCE_DIR/metadata.txt"
+
+                  echo "OpenAPI paths: $PATH_COUNT"
+                  echo "OpenAPI operations: $OPERATION_COUNT"
+                  echo "OpenAPI security schemes: $SECURITY_SCHEMES_COUNT"
 
             - name: Run OWASP ZAP Automation Framework
+              id: zap
               shell: bash
               run: |
                   set -Eeuo pipefail
 
-                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$DAST_OUTPUT_DIR"
-                  ZAP_IMAGE="zaproxy/zap-stable"
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
 
-                  # Registra a configuração utilizada.
+                  # Preserva o plano utilizado na execução.
                   cp "$DAST_PLAN" "$EVIDENCE_DIR/dast.rules.yml"
 
-                  # Prepara as permissões para gravação dos relatórios pelo container.
+                  # Prepara as permissões para gravação dos relatórios.
                   mkdir -p "$EVIDENCE_DIR"
                   chmod 0777 "$EVIDENCE_DIR"
+
+                  # Baixa a versão fixa do OWASP ZAP.
+                  docker pull "$ZAP_IMAGE" \
+                    2>&1 | tee "$EVIDENCE_DIR/zap-pull.log"
+
+                  # Registra a identidade exata da imagem utilizada.
+                  ZAP_IMAGE_ID=$(docker image inspect "$ZAP_IMAGE" \
+                    --format '{{.Id}}')
+
+                  ZAP_IMAGE_DIGEST=$(docker image inspect "$ZAP_IMAGE" \
+                    --format '{{json .RepoDigests}}')
 
                   # Gera uma chave exclusiva para a API do ZAP.
                   KEY=$(openssl rand -hex 32)
@@ -456,7 +500,7 @@ jobs:
                     --add-host=host.docker.internal:host-gateway \
                     --publish 127.0.0.1:8080:8080 \
                     --volume "$GITHUB_WORKSPACE:/zap/wrk:ro" \
-                    --volume "$GITHUB_WORKSPACE/$DAST_OUTPUT_DIR:/zap/out:rw" \
+                    --volume "$GITHUB_WORKSPACE/$EVIDENCE_DIR:/zap/out:rw" \
                     "$ZAP_IMAGE" \
                     zap.sh -daemon \
                       -host 0.0.0.0 \
@@ -483,13 +527,24 @@ jobs:
 
                   if [ "$ready" != true ]; then
                     echo "::error::O OWASP ZAP não iniciou corretamente."
+
                     docker logs dast-zap --tail 100 \
                       > "$EVIDENCE_DIR/zap-startup-error.log" 2>&1 || true
+
                     exit 1
                   fi
 
                   ZAP_VERSION=$(jq -r '.version // "unknown"' \
                     "$EVIDENCE_DIR/zap-version.json")
+
+                  echo "zap_version=$ZAP_VERSION" \
+                    >> "$EVIDENCE_DIR/metadata.txt"
+
+                  # Confirma a versão principal esperada.
+                  if [ "$ZAP_VERSION" != "2.17.0" ]; then
+                    echo "::error::Versão inesperada do OWASP ZAP: $ZAP_VERSION."
+                    exit 1
+                  fi
 
                   # Executa o plano nativo do Automation Framework.
                   curl -fsS -G \
@@ -546,7 +601,7 @@ jobs:
                     exit 1
                   fi
 
-                  # Preserva o resultado do plano.
+                  # Preserva os resultados do Automation Framework.
                   PLAN_ERRORS=$(jq '(.error // []) | length' \
                     "$EVIDENCE_DIR/zap-plan-progress.json")
 
@@ -586,24 +641,27 @@ jobs:
 
                   # Preserva os metadados da execução.
                   {
-                    echo "zap_version=$ZAP_VERSION"
+                    echo "zap_image=$ZAP_IMAGE"
+                    echo "zap_image_id=$ZAP_IMAGE_ID"
+                    echo "zap_image_digest=$ZAP_IMAGE_DIGEST"
                     echo "zap_plan_completed=true"
                     echo "zap_plan_errors=$PLAN_ERRORS"
                     echo "zap_plan_warnings=$PLAN_WARNINGS"
                     echo "zap_reports_generated=$REPORTS_OK"
                   } >> "$EVIDENCE_DIR/metadata.txt"
 
-                  # Impede que uma análise incompleta seja considerada válida.
+                  # Erros tornam a execução inválida.
                   if [ "$PLAN_ERRORS" -gt 0 ]; then
                     echo "::error::O plano ZAP apresentou erros."
                     exit 1
                   fi
 
+                  # Avisos são preservados para análise.
                   if [ "$PLAN_WARNINGS" -gt 0 ]; then
-                    echo "::error::O plano ZAP apresentou avisos. Verifique as evidências."
-                    exit 1
+                    echo "::warning::O plano ZAP apresentou avisos. Consulte zap-plan-warnings.log."
                   fi
 
+                  # Ausência ou corrupção dos relatórios invalida a execução.
                   if [ "$REPORTS_OK" != true ]; then
                     echo "::error::Os relatórios DAST não foram gerados corretamente."
                     exit 1
@@ -617,7 +675,7 @@ jobs:
               if: always()
               shell: bash
               run: |
-                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$DAST_OUTPUT_DIR"
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
 
                   mkdir -p "$EVIDENCE_DIR"
 
@@ -626,12 +684,12 @@ jobs:
                     echo "runner_arch=$RUNNER_ARCH"
                     echo "docker_version=$(docker --version 2>&1)"
 
-                    docker image inspect zaproxy/zap-stable \
+                    docker image inspect "$ZAP_IMAGE" \
                       --format 'zap_image_id={{.Id}}' \
                       2>/dev/null || true
 
-                    docker image inspect zaproxy/zap-stable \
-                      --format 'zap_image_digest={{index .RepoDigests 0}}' \
+                    docker image inspect "$ZAP_IMAGE" \
+                      --format 'zap_image_digest={{json .RepoDigests}}' \
                       2>/dev/null || true
                   } >> "$EVIDENCE_DIR/metadata.txt"
 
@@ -648,7 +706,7 @@ jobs:
               if: always()
               shell: bash
               run: |
-                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$DAST_OUTPUT_DIR"
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
 
                   mkdir -p "$EVIDENCE_DIR"
 

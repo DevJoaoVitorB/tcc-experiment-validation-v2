@@ -1,6 +1,15 @@
 # OWASP ZAP Automation Framework
 # Plano DAST compartilhado pelos grupos A e B.
-# A API é descoberta por meio da especificação OpenAPI publicada em /openapi.json.
+#
+# Estratégia:
+# 1. Importar operações documentadas no OpenAPI.
+# 2. Explorar recursos adicionais por meio do Spider.
+# 3. Identificar requisições de autenticação quando possível.
+# 4. Executar análise passiva e ativa sobre o contexto descoberto.
+# 5. Gerar relatórios JSON e HTML.
+#
+# A cobertura autenticada é uma tentativa adaptativa, não uma garantia.
+# Nenhuma rota, campo de credencial ou formato de token é presumido.
 
 env:
     contexts:
@@ -9,6 +18,9 @@ env:
               - http://host.docker.internal:3000
           includePaths:
               - 'http://host\.docker\.internal:3000/.*'
+          authentication:
+              method: autodetect
+              parameters: {}
 
 jobs:
     # Importa as operações documentadas pela própria API.
@@ -18,14 +30,27 @@ jobs:
           context: authentication-api
           targetUrl: http://host.docker.internal:3000
 
+    # Explora recursos adicionais acessíveis a partir da raiz da API.
+    # Complementa o OpenAPI, sem depender de endpoints específicos.
+    - type: spider
+      parameters:
+          context: authentication-api
+          url: http://host.docker.internal:3000
+          maxDuration: 2
+          maxDepth: 5
+          threadCount: 2
+
     # Configura a análise passiva.
+    # Inclui a identificação de requisições de autenticação pelo
+    # Authentication Helper, quando padrões reconhecidos forem observados.
     - type: passiveScan-config
       parameters:
           maxAlertsPerRule: 0
           scanOnlyInScope: true
           maxBodySizeInBytesToScan: 0
 
-    # Aguarda o processamento passivo das requisições importadas.
+    # Aguarda o processamento passivo das requisições importadas
+    # e das requisições geradas pelo Spider.
     - type: passiveScan-wait
       parameters:
           maxDuration: 5
@@ -38,7 +63,9 @@ jobs:
           maxAlertsPerRule: 0
           threadPerHost: 2
 
-    # Executa a análise ativa sobre o contexto importado.
+    # Executa análise ativa sobre o contexto descoberto.
+    # Caso a autenticação seja identificada e configurada pelo ZAP,
+    # o contexto poderá utilizar esse mecanismo durante a análise.
     - type: activeScan
       parameters:
           context: authentication-api
@@ -48,7 +75,8 @@ jobs:
           defaultStrength: Medium
           defaultThreshold: Medium
 
-    # Aguarda o processamento passivo das requisições geradas pelo scanner.
+    # Aguarda o processamento passivo das requisições geradas
+    # durante a análise ativa.
     - type: passiveScan-wait
       parameters:
           maxDuration: 5
