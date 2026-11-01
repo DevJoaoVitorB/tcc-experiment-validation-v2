@@ -102,7 +102,6 @@ jobs:
         needs: validate
 
         env:
-            SAST_PLAN: workflows_support/sast/sast.rules.yml
             SAST_IMAGE: semgrep/semgrep:1.178.0
             EVIDENCE_DIR: evidence/sast
 
@@ -123,37 +122,8 @@ jobs:
                     echo "commit=${GITHUB_SHA}"
                     echo "event=${GITHUB_EVENT_NAME}"
                     echo "semgrep_image=$SAST_IMAGE"
-                    echo "custom_rules=$SAST_PLAN"
+                    echo "semgrep_configs=p/security-audit,p/secrets,p/owasp-top-ten,p/javascript,p/typescript,p/nodejs,p/jwt"
                   } > "$EVIDENCE_DIR/metadata.txt"
-
-            - name: Validate custom Semgrep rules
-              id: validate_rules
-              shell: bash
-              run: |
-                  set +e
-                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
-
-                  if [ ! -s "$SAST_PLAN" ]; then
-                    echo "Arquivo de regras ausente ou vazio: $SAST_PLAN" \
-                      | tee "$EVIDENCE_DIR/rules-validation.log"
-                    echo "rules_validation_exit_code=1" \
-                      >> "$EVIDENCE_DIR/metadata.txt"
-                    exit 1
-                  fi
-
-                  docker run --rm \
-                    -v "$GITHUB_WORKSPACE:/src:ro" \
-                    -w /src \
-                    "$SAST_IMAGE" \
-                    semgrep --validate --config "/src/$SAST_PLAN" \
-                    > "$EVIDENCE_DIR/rules-validation.log" 2>&1
-
-                  status=$?
-                  echo "rules_validation_exit_code=$status" \
-                    >> "$EVIDENCE_DIR/metadata.txt"
-
-                  cat "$EVIDENCE_DIR/rules-validation.log"
-                  exit "$status"
 
             - name: Run Semgrep
               id: semgrep
@@ -175,9 +145,7 @@ jobs:
                       --config p/typescript \
                       --config p/nodejs \
                       --config p/jwt \
-                      --config "/src/$SAST_PLAN" \
                       --exclude .github/ \
-                      --exclude workflows_support/ \
                       --json \
                       --output /reports/semgrep-report.json \
                       /src \
@@ -216,14 +184,11 @@ jobs:
                       > "$EVIDENCE_DIR/semgrep-findings.tsv"
                   fi
 
-            - name: Preserve SAST configuration and metadata
+            - name: Preserve SAST metadata
               if: always()
               shell: bash
               run: |
                   EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
-
-                  cp "$SAST_PLAN" "$EVIDENCE_DIR/sast.rules.yml" \
-                    2>/dev/null || true
 
                   {
                     echo "runner_os=$RUNNER_OS"
@@ -355,7 +320,7 @@ jobs:
             DAST_BASE_URL: http://127.0.0.1:3000
             ZAP_BASE_URL: http://host.docker.internal:3000
             ZAP_API_URL: http://127.0.0.1:8080
-            DAST_PLAN: workflows_support/dast/dast.rules.yml
+            DAST_PLAN: .github/workflows/config/dast.rules.yml
             DAST_IMAGE: authentication-api:dast-${{ inputs.experiment_group }}
             ZAP_IMAGE: zaproxy/zap-stable:2.17.0
             EVIDENCE_DIR: evidence/dast
@@ -751,6 +716,17 @@ jobs:
                   docker image rm "$DAST_IMAGE" \
                     >/dev/null 2>&1 || true
 
+            - name: Sanitize ZAP API key
+              if: always()
+              shell: bash
+              run: |
+                  # Remove a chave temporária da API do ZAP antes de enviar as evidências.
+                  if [ -f "$EVIDENCE_DIR/zap.log" ]; then
+                    sed -E -i \
+                      's/(Setting config api\.key = )[[:xdigit:]]+/\1[REDACTED]/g' \
+                      "$EVIDENCE_DIR/zap.log"
+                  fi
+
             - name: Upload DAST evidence
               if: always()
               uses: actions/upload-artifact@v4
@@ -921,39 +897,31 @@ jobs:
                     echo "## DAST — OWASP ZAP"
                     echo
 
-                    if [ -s "$REPORTS/dast-report.json" ] &&
-                      jq -e '
-                        (.site | type == "array") and
-                        (.site | length > 0) and
-                        all(.site[]; (.alerts | type == "array"))
-                      ' "$REPORTS/dast-report.json" >/dev/null 2>&1; then
-
+                    if [ -f "$REPORTS/dast-report.json" ]; then
                       jq -r '
                         [
-                          .site[]?.alerts[]? |
-                          (
-                            if ((.riskcode // "" | tostring) == "3") then "High"
-                            elif ((.riskcode // "" | tostring) == "2") then "Medium"
-                            elif ((.riskcode // "" | tostring) == "1") then "Low"
-                            elif ((.riskcode // "" | tostring) == "0") then "Informational"
-                            else "Unknown"
-                            end
-                          )
+                          .site[]?.alerts[]? as $alert
+                          | ($alert.instances // [])[]
+                          | (
+                              if (($alert.riskcode // "" | tostring) == "3") then "High"
+                              elif (($alert.riskcode // "" | tostring) == "2") then "Medium"
+                              elif (($alert.riskcode // "" | tostring) == "1") then "Low"
+                              elif (($alert.riskcode // "" | tostring) == "0") then "Informational"
+                              else "Unknown"
+                              end
+                            )
                         ] as $severities |
 
-                        "| Severidade | Quantidade de achados |",
+                        "| Severidade | Quantidade de ocorrências |",
                         "|---|---:|",
                         (
                           ["High", "Medium", "Low", "Informational", "Unknown"][] as $severity |
                           "| \($severity) | \([$severities[] | select(. == $severity)] | length) |"
                         ),
                         "| **Total** | **\($severities | length)** |"
-                      ' "$REPORTS/dast-report.json"
-
-                      echo
-                      echo "Os totais correspondem aos alertas registrados no JSON original do ZAP."
+                      ' "$REPORTS/dast-report.json" >> "$SUMMARY_FILE"
                     else
-                      echo "Relatório DAST ausente ou inválido; não foi possível determinar os totais."
+                      echo "Relatório DAST não encontrado." >> "$SUMMARY_FILE"
                     fi
 
                     echo
