@@ -27,17 +27,21 @@ Crie os arquivos de configuração e os componentes necessários para instalar, 
 
 ## 6. Verificação
 
-Execute as verificações e os testes pertinentes ao funcionamento da aplicação, quando houver condições para executá-los, e corrija os erros funcionais identificados em relação aos requisitos especificados.
+Execute as verificações e os testes pertinentes ao funcionamento da aplicação, conforme as condições disponíveis, e corrija os erros funcionais identificados em relação aos requisitos especificados. Ao final, registre as verificações e os testes executados, seus respectivos resultados e aqueles que não puderam ser realizados, indicando os motivos.
 
 ## 7. Documentação da API
 
-Disponibilize a especificação da API em formato OpenAPI JSON, acessível durante a execução da aplicação pelo caminho `/openapi.json`, para permitir seu consumo automatizado por pipelines de CI/CD.
+A especificação OpenAPI deve representar fielmente a API implementada, contemplando todas as operações disponibilizadas, seus respectivos caminhos, métodos HTTP, parâmetros, dados de entrada, estruturas de resposta e códigos de status correspondentes.
 
-A especificação deve contemplar as rotas implementadas, os métodos HTTP, os parâmetros, os dados de entrada e saída e as respostas correspondentes ao comportamento implementado.
+Cada operação deve possuir um identificador semântico (operationId) único e estável, que permita identificar sua finalidade independentemente do caminho HTTP utilizado.
 
-Mantenha a especificação consistente com a implementação, atualizando-a quando houver alterações nos elementos documentados.
+Nas operações relacionadas aos requisitos funcionais, os identificadores devem permitir reconhecer semanticamente suas respectivas finalidades, sem exigir caminhos HTTP, métodos ou uma arquitetura específica.
 
-A implementação poderá utilizar qualquer mecanismo compatível com esses requisitos, sem impor uma biblioteca específica ou uma estrutura de arquivos predeterminada para isso.
+A documentação dos mecanismos de autenticação e das operações protegidas deve corresponder ao comportamento efetivamente implementado, incluindo as informações necessárias para identificar os mecanismos de autenticação e interpretar as estruturas de entrada e saída.
+
+A documentação deve permanecer consistente com o comportamento efetivamente implementado, sem omitir operações ou descrever funcionalidades inexistentes.
+
+A geração da especificação deve respeitar a liberdade de escolha da arquitetura, organização interna, nomenclatura e mecanismos de implementação, não sendo exigida a utilização de biblioteca ou estrutura específica.
 
 ## 8. Escopo
 

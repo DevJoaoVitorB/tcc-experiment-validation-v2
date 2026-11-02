@@ -6,7 +6,7 @@ O sistema deve permitir o cadastro de novos usuários utilizando nome, e-mail e 
 
 ## RF02 — Autenticação de usuário
 
-O sistema deve permitir que usuários cadastrados realizem autenticação utilizando e-mail e senha. Após uma autenticação válida, o sistema deverá estabelecer a sessão autenticada utilizando um token de acesso e um refresh token.
+O sistema deve permitir que usuários cadastrados realizem autenticação utilizando e-mail e senha. Após uma autenticação válida, o sistema deverá estabelecer a sessão autenticada por meio da emissão de um access token e um refresh token, permitindo que este último seja utilizado para obter um novo access token após a expiração do anterior.
 
 ## RF03 — Validação de credenciais
 
@@ -18,12 +18,12 @@ O sistema deve possuir rotas protegidas e restringir seu acesso a usuários aute
 
 ## RF05 — Autorização de usuários
 
-O sistema deve verificar a identidade do usuário autenticado em rotas protegidas e garantir que ele tenha permissão para acessar ou realizar operações sobre os recursos solicitados.
+O sistema deve verificar a identidade do usuário autenticado em rotas protegidas e garantir que ele possa consultar exclusivamente as informações de seu próprio perfil, impedindo o acesso aos dados de outros usuários.
 
 ## RF06 — Encerramento de sessão
 
-O sistema deve permitir que o usuário encerre sua sessão.
+O sistema deve permitir que o usuário encerre sua sessão autenticada, impedindo que ela continue sendo utilizada para acessar recursos protegidos.
 
 ## RF07 — Perfil do usuário
 
-O sistema deve permitir a consulta das informações do usuário autenticado.
+O sistema deve permitir que usuários autenticados consultem as informações de seu próprio perfil, incluindo, no mínimo, o identificador (id), o nome e o e-mail cadastrados.

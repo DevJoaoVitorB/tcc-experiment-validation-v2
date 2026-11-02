@@ -1,272 +1,969 @@
 name: Authentication API Experiment
 
 on:
-  workflow_dispatch:
+    workflow_dispatch:
+        inputs:
+            experiment_group:
+                description: 'Grupo do Experimento que Será Executado'
+                type: choice
+                options:
+                    - A
+                    - B
+                required: true
+                default: A
+
+            delete_temp_artifacts:
+                description: 'Excluir Artefatos Temporários Após Final da Análise'
+                type: boolean
+                required: true
+                default: true
 
 permissions:
-  contents: read
+    contents: read
 
 jobs:
-  # 1. Valida a aplicação e registra as versões/arquivos usados no experimento.
-  validate:
-    name: Validate Application
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
+    # 1. Validação da aplicação
+    validate:
+        name: Validate - Grupo ${{ inputs.experiment_group }}
+        runs-on: ubuntu-24.04
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22.14.0
-          cache: npm
-
-      - name: Validate application
-        run: |
-          npm ci
-          npx prisma generate
-          npm test -- --exclude "workflows_support/dast-rs01-rs07.test.ts"
-          npm run build
-
-      # Guarda metadados e hashes para identificar exatamente a execução do experimento.
-      - name: Record run metadata
-        if: always()
-        shell: bash
-        run: |
-          mkdir -p evidence
-          {
-            echo "run_id=$GITHUB_RUN_ID"
-            echo "run_attempt=$GITHUB_RUN_ATTEMPT"
-            echo "commit=$GITHUB_SHA"
-            echo "runner_os=$RUNNER_OS"
-            echo "node=$(node --version 2>&1 || true)"
-            echo "npm=$(npm --version 2>&1 || true)"
-            echo "docker=$(docker --version 2>&1 || true)"
-            echo "checkout_action=actions/checkout@v4"
-            echo "setup_node_action=actions/setup-node@v4"
-            echo "upload_artifact_action=actions/upload-artifact@v4"
-          } > evidence/environment.txt
-          for file in package.json package-lock.json AGENTS.md .github/workflows/experiment.yml \
-            workflows_support/sast-rs01-rs07.rules.yml workflows_support/dast-rs01-rs07.test.ts \
-            docker-compose.yml compose.yml Dockerfile; do
-            [ ! -f "$file" ] || sha256sum "$file" >> evidence/input-sha256.txt
-          done
-
-      - name: Upload validation evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: validate-evidence
-          path: evidence/
-          if-no-files-found: warn
-          retention-days: 90
-
-  # 2. SAST: mantém relatório completo e inventário com regra, arquivo, linha e severidade.
-  sast:
-    name: SAST (Semgrep)
-    runs-on: ubuntu-24.04
-    needs: validate
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run Semgrep and preserve evidence
-        shell: bash
-        run: |
-          mkdir -p evidence
-          set +e
-          docker run --rm -v "$PWD:/src:ro" -v "$PWD/evidence:/reports:rw" -w /src \
-            semgrep/semgrep:1.105.0 semgrep scan \
-            --config p/security-audit --config p/secrets --config p/owasp-top-ten \
-            --config p/javascript --config p/typescript --config p/nodejs --config p/jwt \
-            --config /src/workflows_support/sast-rs01-rs07.rules.yml \
-            --json --output /reports/sast-report.json . > evidence/sast-console.txt 2>&1
-          code=$?
-          echo "$code" > evidence/sast-exit-code.txt
-          set -e
-          cat evidence/sast-console.txt
-
-          # TSV facilita filtrar manualmente achados de testes/infra sem apagar o relatório bruto.
-          if [ -f evidence/sast-report.json ]; then
-            jq -r '.results[]? | [.check_id, .path, (.start.line // 0 | tostring), (.extra.severity // "UNKNOWN"), (.extra.message // "")] | @tsv' \
-              evidence/sast-report.json > evidence/sast-findings.tsv || true
-          fi
-          semgrep_version=$(docker run --rm semgrep/semgrep:1.105.0 semgrep --version 2>&1 || true)
-          echo "$semgrep_version" > evidence/semgrep-version.txt
-          cp workflows_support/sast-rs01-rs07.rules.yml evidence/ 2>/dev/null || true
-          cp .github/workflows/experiment.yml evidence/experiment.yml 2>/dev/null || true
-          echo "commit=$GITHUB_SHA" >> evidence/environment.txt
-          echo "run_id=$GITHUB_RUN_ID" >> evidence/environment.txt
-
-          # Código 1 significa que há achados; códigos diferentes de 0/1 indicam erro de execução.
-          if [ "$code" != "0" ] && [ "$code" != "1" ]; then
-            echo "Semgrep não concluiu corretamente (código $code)." >&2
-            exit 1
-          fi
-
-      - name: Upload SAST evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: sast-evidence
-          path: evidence/
-          if-no-files-found: warn
-          retention-days: 90
-
-  # 3. SCA: relatório geral inclui dependências de desenvolvimento; o segundo cobre produção.
-  sca:
-    name: SCA (npm audit)
-    runs-on: ubuntu-24.04
-    needs: validate
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22.14.0
-          cache: npm
-
-      - name: Audit dependencies and preserve evidence
-        shell: bash
-        run: |
-          mkdir -p evidence
-          npm ci
-          # npm audit pode retornar código diferente de zero por vulnerabilidades; os relatórios são preservados.
-          set +e
-          npm audit --json > evidence/sca-report-all.json 2> evidence/sca-stderr-all.txt
-          echo "$?" > evidence/npm-audit-all-exit-code.txt
-          npm audit --omit=dev --json > evidence/sca-report-production.json 2> evidence/sca-stderr-production.txt
-          echo "$?" > evidence/npm-audit-production-exit-code.txt
-          set -e
-          {
-            echo "run_id=$GITHUB_RUN_ID"
-            echo "commit=$GITHUB_SHA"
-            echo "node=$(node --version 2>&1 || true)"
-            echo "npm=$(npm --version 2>&1 || true)"
-            echo "audit_all=npm audit --json"
-            echo "audit_production=npm audit --omit=dev --json"
-          } > evidence/environment.txt
-          cp package.json package-lock.json evidence/
-          sha256sum package.json package-lock.json > evidence/dependency-files-sha256.txt
-
-      - name: Upload SCA evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: sca-evidence
-          path: evidence/
-          if-no-files-found: warn
-          retention-days: 90
-
-  # 4. DAST: inicia a API, obtém o OpenAPI em execução, executa ZAP e os testes complementares.
-  dast:
-    name: DAST (OWASP ZAP + Complementary Tests)
-    runs-on: ubuntu-24.04
-    needs: validate
-    timeout-minutes: 30
-    env:
-      JWT_ACCESS_SECRET: "dast-test-access-secret-CHANGE-ME-123456789"
-      JWT_REFRESH_SECRET: "dast-test-refresh-secret-CHANGE-ME-123456789"
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Start API and run DAST
-        shell: bash
         env:
-          DAST_BASE_URL: http://localhost:3000
-          DAST_REPORT_PATH: ${{ runner.temp }}/dast-evidence/dast-rs01-rs07-report.json
-          DAST_RATE_LIMIT_ATTEMPTS: "30"
-        run: |
-          mkdir -p "$RUNNER_TEMP/dast-evidence"
-          cd "$GITHUB_WORKSPACE"
-          EVIDENCE="$RUNNER_TEMP/dast-evidence"
+            DATABASE_URL: 'file:./test.db'
+            EVIDENCE_DIR: evidence/validate
 
-          # Registra o resultado da inicialização para diferenciar erro de infraestrutura de achados de segurança.
-          set +e
-          docker compose up --build -d > "$EVIDENCE/compose-up.txt" 2>&1
-          compose_code=$?
-          echo "$compose_code" > "$EVIDENCE/compose-up-exit-code.txt"
-          set -e
-          cat "$EVIDENCE/compose-up.txt"
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
 
-          if [ "$compose_code" -eq 0 ]; then
-            # Aguarda a API e valida a especificação real antes de iniciar o ZAP.
-            for attempt in {1..30}; do
-              if curl -fsS http://localhost:3000/health >/dev/null && \
-                 curl -fsS http://localhost:3000/openapi.json -o "$EVIDENCE/openapi-runtime.json" && \
-                 jq -e 'type == "object" and .openapi != null and (.paths | type == "object")' "$EVIDENCE/openapi-runtime.json" >/dev/null; then
-                jq 'if (.servers | type) == "array" and (.servers | length) > 0 then .servers[0].url = "http://host.docker.internal:3000" | .servers = [ .servers[0] ] else .servers = [{"url":"http://host.docker.internal:3000"}] end' \
-                  "$EVIDENCE/openapi-runtime.json" > "$EVIDENCE/openapi-for-zap.json"
-                break
-              fi
-              sleep 2
-            done
-          fi
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: '22.14.0'
+                  cache: npm
 
-          # ZAP e testes complementares podem falhar, mas os códigos e logs ficam guardados.
-          if [ -f "$EVIDENCE/openapi-for-zap.json" ]; then
-            set +e
-            docker run --rm --add-host=host.docker.internal:host-gateway \
-              -v "$EVIDENCE:/zap/wrk:ro" -v "$EVIDENCE:/zap/reports:rw" \
-              ghcr.io/zaproxy/zaproxy:2.16.1 zap-api-scan.py \
-              -t /zap/wrk/openapi-for-zap.json -f openapi \
-              -r /zap/reports/dast-report.html -J /zap/reports/dast-report.json \
-              -w /zap/reports/dast-report.md -I > "$EVIDENCE/zap-console.txt" 2>&1
-            echo "$?" > "$EVIDENCE/zap-exit-code.txt"
-            cat "$EVIDENCE/zap-console.txt"
+            - name: Initialize validation evidence
+              shell: bash
+              run: |
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+                  mkdir -p "$EVIDENCE_DIR"
 
-            node --experimental-strip-types workflows_support/dast-rs01-rs07.test.ts \
-              > "$EVIDENCE/complementary-console.txt" 2>&1
-            echo "$?" > "$EVIDENCE/complementary-exit-code.txt"
-            set -e
-            cat "$EVIDENCE/complementary-console.txt"
-          else
-            echo "OpenAPI ausente ou inválido; ZAP e testes complementares não executados." > "$EVIDENCE/openapi-error.txt"
-          fi
+                  {
+                    echo "experiment_group=${{ inputs.experiment_group }}"
+                    echo "run_id=${GITHUB_RUN_ID}"
+                    echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+                    echo "commit=${GITHUB_SHA}"
+                    echo "event=${GITHUB_EVENT_NAME}"
+                    echo "node_version=$(node --version)"
+                    echo "npm_version=$(npm --version)"
+                  } > "$EVIDENCE_DIR/metadata.txt"
 
-          # Registra versões, arquivos de configuração e hashes para reproduzir a execução.
-          {
-            echo "run_id=$GITHUB_RUN_ID"
-            echo "run_attempt=$GITHUB_RUN_ATTEMPT"
-            echo "commit=$GITHUB_SHA"
-            echo "runner_os=$RUNNER_OS"
-            echo "node=$(node --version 2>&1 || true)"
-            echo "npm=$(npm --version 2>&1 || true)"
-            echo "docker=$(docker --version 2>&1 || true)"
-            echo "zap_image=ghcr.io/zaproxy/zaproxy:2.16.1"
-            docker image inspect ghcr.io/zaproxy/zaproxy:2.16.1 --format '{{index .RepoDigests 0}}' 2>/dev/null || true
-          } > "$EVIDENCE/environment.txt"
-          cp .github/workflows/experiment.yml "$EVIDENCE/experiment.yml" 2>/dev/null || true
-          cp workflows_support/dast-rs01-rs07.test.ts "$EVIDENCE/" 2>/dev/null || true
-          cp docker-compose.yml "$EVIDENCE/" 2>/dev/null || cp compose.yml "$EVIDENCE/" 2>/dev/null || true
-          [ ! -f Dockerfile ] || cp Dockerfile "$EVIDENCE/"
-          find "$EVIDENCE" -maxdepth 1 -type f ! -name evidence-sha256.txt -print0 | sort -z | xargs -0 -r sha256sum > "$EVIDENCE/evidence-sha256.txt"
+            - name: Install dependencies
+              run: npm ci
 
-      # Envia as evidências mesmo quando a API, o ZAP ou um teste falha.
-      - name: Upload DAST evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dast-evidence
-          path: ${{ runner.temp }}/dast-evidence/
-          if-no-files-found: warn
-          retention-days: 90
+            - name: Generate Prisma Client
+              run: npx prisma generate
 
-      # Falha após o upload se uma etapa essencial não foi executada ou terminou com erro.
-      - name: Check DAST execution status
-        if: always()
-        shell: bash
-        run: |
-          EVIDENCE="$RUNNER_TEMP/dast-evidence"
-          errors=0
-          for file in compose-up-exit-code.txt zap-exit-code.txt complementary-exit-code.txt; do
-            path="$EVIDENCE/$file"
-            if [ ! -f "$path" ] || [ "$(cat "$path")" != "0" ]; then
-              echo "Etapa ausente ou com erro: $file"
-              errors=1
-            fi
-          done
-          [ -f "$EVIDENCE/openapi-for-zap.json" ] || { echo "OpenAPI não preparado; DAST incompleto."; errors=1; }
-          exit "$errors"
+            - name: Run tests
+              id: tests
+              shell: bash
+              run: |
+                  set +e
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+                  npm test 2>&1 | tee "$EVIDENCE_DIR/tests.log"
+                  status=${PIPESTATUS[0]}
+                  echo "tests_exit_code=$status" >> "$EVIDENCE_DIR/metadata.txt"
+                  exit "$status"
 
-      - name: Stop API
-        if: always()
-        run: docker compose down --volumes --remove-orphans
+            - name: Build application
+              id: build
+              if: always() && steps.tests.outcome == 'success'
+              shell: bash
+              run: |
+                  set +e
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+                  npm run build 2>&1 | tee "$EVIDENCE_DIR/build.log"
+                  status=${PIPESTATUS[0]}
+                  echo "build_exit_code=$status" >> "$EVIDENCE_DIR/metadata.txt"
+                  exit "$status"
+
+            - name: Upload validation evidence
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: validate-evidence-${{ inputs.experiment_group }}
+                  path: evidence/validate/
+                  if-no-files-found: warn
+                  retention-days: 14
+
+    # 2. Análise Estática do Código-Fonte (SAST - Semgrep)
+    sast:
+        name: SAST - Grupo ${{ inputs.experiment_group }}
+        runs-on: ubuntu-24.04
+        needs: validate
+
+        env:
+            SAST_IMAGE: semgrep/semgrep:1.178.0
+            EVIDENCE_DIR: evidence/sast
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Initialize SAST evidence
+              shell: bash
+              run: |
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+                  mkdir -p "$EVIDENCE_DIR"
+
+                  {
+                    echo "experiment_group=${{ inputs.experiment_group }}"
+                    echo "run_id=${GITHUB_RUN_ID}"
+                    echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+                    echo "commit=${GITHUB_SHA}"
+                    echo "event=${GITHUB_EVENT_NAME}"
+                    echo "semgrep_image=$SAST_IMAGE"
+                    echo "semgrep_configs=p/security-audit,p/secrets,p/owasp-top-ten,p/javascript,p/typescript,p/nodejs,p/jwt"
+                  } > "$EVIDENCE_DIR/metadata.txt"
+
+            - name: Run Semgrep
+              id: semgrep
+              shell: bash
+              run: |
+                  set +e
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+
+                  docker run --rm \
+                    -v "$GITHUB_WORKSPACE:/src:ro" \
+                    -v "$EVIDENCE_DIR:/reports:rw" \
+                    -w /src \
+                    "$SAST_IMAGE" \
+                    semgrep scan \
+                      --config p/security-audit \
+                      --config p/secrets \
+                      --config p/owasp-top-ten \
+                      --config p/javascript \
+                      --config p/typescript \
+                      --config p/nodejs \
+                      --config p/jwt \
+                      --exclude .github/ \
+                      --exclude evidence/
+                      --json \
+                      --output /reports/semgrep-report.json \
+                      /src \
+                    > "$EVIDENCE_DIR/semgrep.log" 2>&1
+
+                  status=$?
+                  echo "semgrep_exit_code=$status" \
+                    >> "$EVIDENCE_DIR/metadata.txt"
+
+                  cat "$EVIDENCE_DIR/semgrep.log"
+
+                  if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
+                    echo "Falha na execução do Semgrep." \
+                      | tee "$EVIDENCE_DIR/error.txt"
+                    exit "$status"
+                  fi
+
+                  if [ ! -s "$EVIDENCE_DIR/semgrep-report.json" ]; then
+                    echo "O Semgrep não gerou o relatório JSON esperado." \
+                      | tee "$EVIDENCE_DIR/error.txt"
+                    exit 1
+                  fi
+
+                  # Gera uma tabela auxiliar sem alterar o relatório original.
+                  if command -v jq >/dev/null 2>&1; then
+                    jq -r '
+                      ["rule_id", "path", "line", "severity", "message"],
+                      (.results[]? | [
+                        .check_id,
+                        .path,
+                        (.start.line // 0),
+                        (.extra.severity // "UNKNOWN"),
+                        (.extra.message // "")
+                      ]) | @tsv
+                    ' "$EVIDENCE_DIR/semgrep-report.json" \
+                      > "$EVIDENCE_DIR/semgrep-findings.tsv"
+                  fi
+
+            - name: Preserve SAST metadata
+              if: always()
+              shell: bash
+              run: |
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+
+                  {
+                    echo "runner_os=$RUNNER_OS"
+                    echo "runner_arch=$RUNNER_ARCH"
+                    echo "docker_version=$(docker --version 2>&1)"
+                    echo "semgrep_image=$SAST_IMAGE"
+                    docker image inspect "$SAST_IMAGE" \
+                      --format 'image_digest={{index .RepoDigests 0}}' \
+                      2>/dev/null || true
+                  } >> "$EVIDENCE_DIR/metadata.txt"
+
+                  if [ -f "$EVIDENCE_DIR/semgrep-report.json" ]; then
+                    sha256sum "$EVIDENCE_DIR/semgrep-report.json" \
+                      > "$EVIDENCE_DIR/report-sha256.txt"
+                  fi
+
+            - name: Upload SAST evidence
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: sast-evidence-${{ inputs.experiment_group }}
+                  path: evidence/sast/
+                  if-no-files-found: warn
+                  retention-days: 90
+
+    # 3. Análise de Dependências Diretas e Transitivas (SCA - npm audit)
+    sca:
+        name: SCA - Grupo ${{ inputs.experiment_group }}
+        runs-on: ubuntu-24.04
+        needs: validate
+
+        env:
+            EVIDENCE_DIR: evidence/sca
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: '22.14.0'
+                  cache: npm
+
+            - name: Initialize SCA evidence
+              shell: bash
+              run: |
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+                  mkdir -p "$EVIDENCE_DIR"
+
+                  {
+                    echo "experiment_group=${{ inputs.experiment_group }}"
+                    echo "run_id=${GITHUB_RUN_ID}"
+                    echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+                    echo "commit=${GITHUB_SHA}"
+                    echo "event=${GITHUB_EVENT_NAME}"
+                    echo "node_version=$(node --version)"
+                    echo "npm_version=$(npm --version)"
+                  } > "$EVIDENCE_DIR/metadata.txt"
+
+            - name: Install dependencies
+              run: npm ci
+
+            - name: Audit all dependencies
+              id: audit_all
+              shell: bash
+              run: |
+                  set +e
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+
+                  npm audit --json \
+                    > "$EVIDENCE_DIR/npm-audit-all.json" \
+                    2> "$EVIDENCE_DIR/npm-audit-all.log"
+
+                  status=$?
+                  echo "audit_all_exit_code=$status" \
+                    >> "$EVIDENCE_DIR/metadata.txt"
+
+                  if [ "$status" -ne 0 ] && \
+                    ! jq -e '.auditReportVersion and .metadata.vulnerabilities' \
+                      "$EVIDENCE_DIR/npm-audit-all.json" >/dev/null 2>&1; then
+                    echo "Falha na execução do npm audit para todas as dependências." \
+                      | tee "$EVIDENCE_DIR/error-all.txt"
+                    exit 1
+                  fi
+
+            - name: Audit production dependencies
+              id: audit_prod
+              shell: bash
+              run: |
+                  set +e
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+
+                  npm audit --omit=dev --json \
+                    > "$EVIDENCE_DIR/npm-audit-production.json" \
+                    2> "$EVIDENCE_DIR/npm-audit-production.log"
+
+                  status=$?
+                  echo "audit_production_exit_code=$status" \
+                    >> "$EVIDENCE_DIR/metadata.txt"
+
+                  if [ "$status" -ne 0 ] && \
+                    ! jq -e '.auditReportVersion and .metadata.vulnerabilities' \
+                      "$EVIDENCE_DIR/npm-audit-production.json" >/dev/null 2>&1; then
+                    echo "Falha na execução do npm audit para dependências de produção." \
+                      | tee "$EVIDENCE_DIR/error-production.txt"
+                    exit 1
+                  fi
+
+            - name: Upload SCA evidence
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: sca-evidence-${{ inputs.experiment_group }}
+                  path: evidence/sca/
+                  if-no-files-found: warn
+                  retention-days: 14
+
+    # 4. Análise Dinâmica da Aplicação (DAST - OWASP ZAP)
+    dast:
+        name: DAST - Grupo ${{ inputs.experiment_group }}
+        runs-on: ubuntu-24.04
+        needs: validate
+        timeout-minutes: 45
+
+        env:
+            JWT_ACCESS_SECRET: 'dast-test-access-secret-CHANGE-ME-123456789'
+            JWT_REFRESH_SECRET: 'dast-test-refresh-secret-CHANGE-ME-123456789'
+            DAST_BASE_URL: http://127.0.0.1:3000
+            ZAP_BASE_URL: http://host.docker.internal:3000
+            ZAP_API_URL: http://127.0.0.1:8080
+            DAST_PLAN: .github/workflows/config/dast.rules.yml
+            DAST_IMAGE: authentication-api:dast-${{ inputs.experiment_group }}
+            ZAP_IMAGE: zaproxy/zap-stable:2.17.0
+            EVIDENCE_DIR: evidence/dast
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Initialize DAST evidence
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+                  mkdir -p "$EVIDENCE_DIR"
+
+                  {
+                    echo "experiment_group=${{ inputs.experiment_group }}"
+                    echo "run_id=${GITHUB_RUN_ID}"
+                    echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+                    echo "commit=${GITHUB_SHA}"
+                    echo "event=${GITHUB_EVENT_NAME}"
+                    echo "zap_image=$ZAP_IMAGE"
+                    echo "dast_plan=$DAST_PLAN"
+                  } > "$EVIDENCE_DIR/metadata.txt"
+
+            - name: Build and start application
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+
+                  docker build \
+                    -t "$DAST_IMAGE" . \
+                    2>&1 | tee "$EVIDENCE_DIR/docker-build.log"
+
+                  docker run -d \
+                    --name dast-api \
+                    --publish 3000:3000 \
+                    --env NODE_ENV=test \
+                    --env DATABASE_URL='file:./test.db' \
+                    --env JWT_ACCESS_SECRET="$JWT_ACCESS_SECRET" \
+                    --env JWT_REFRESH_SECRET="$JWT_REFRESH_SECRET" \
+                    "$DAST_IMAGE" \
+                    > "$EVIDENCE_DIR/container-id.txt"
+
+                  # Aguarda a API disponibilizar sua especificação OpenAPI.
+                  ready=false
+
+                  for attempt in $(seq 1 60); do
+                    if curl -fsS --max-time 3 \
+                      "$DAST_BASE_URL/openapi.json" \
+                      -o "$EVIDENCE_DIR/openapi.json"; then
+
+                      ready=true
+                      break
+                    fi
+
+                    if [ "$(docker inspect -f '{{.State.Running}}' dast-api 2>/dev/null || echo false)" != true ]; then
+                      break
+                    fi
+
+                    sleep 2
+                  done
+
+                  if [ "$ready" != true ] || \
+                    ! jq -e '(.paths | type == "object") and (.paths | length > 0)' \
+                    "$EVIDENCE_DIR/openapi.json" >/dev/null 2>&1; then
+
+                    echo "::error::A API não disponibilizou uma especificação OpenAPI válida em /openapi.json."
+                    exit 1
+                  fi
+
+                  # Registra a quantidade de caminhos e operações documentadas.
+                  PATH_COUNT=$(jq '.paths | length' \
+                    "$EVIDENCE_DIR/openapi.json")
+
+                  OPERATION_COUNT=$(jq '
+                    [
+                      .paths[] |
+                      to_entries[] |
+                      select(
+                        .key == "get" or
+                        .key == "post" or
+                        .key == "put" or
+                        .key == "patch" or
+                        .key == "delete" or
+                        .key == "options" or
+                        .key == "head" or
+                        .key == "trace"
+                      )
+                    ] | length
+                  ' "$EVIDENCE_DIR/openapi.json")
+
+                  SECURITY_SCHEMES_COUNT=$(jq '
+                    (.components.securitySchemes // {}) | length
+                  ' "$EVIDENCE_DIR/openapi.json")
+
+                  # Conta operações com segurança efetiva declarada.
+                  # A segurança definida na operação substitui a global.
+                  SECURED_OPERATION_COUNT=$(jq '
+                    . as $spec |
+                    [
+                      .paths[]? |
+                      to_entries[] |
+                      select(
+                        .key == "get" or
+                        .key == "post" or
+                        .key == "put" or
+                        .key == "patch" or
+                        .key == "delete" or
+                        .key == "options" or
+                        .key == "head" or
+                        .key == "trace"
+                      ) |
+                      select(
+                        if has("value") then
+                          if (.value | has("security")) then
+                            ((.value.security // []) | length) > 0
+                          else
+                            (($spec.security // []) | length) > 0
+                          end
+                        else
+                          false
+                        end
+                      )
+                    ] | length
+                  ' "$EVIDENCE_DIR/openapi.json")
+
+                  {
+                    echo "openapi_paths=$PATH_COUNT"
+                    echo "openapi_operations=$OPERATION_COUNT"
+                    echo "openapi_security_schemes=$SECURITY_SCHEMES_COUNT"
+                    echo "openapi_secured_operations=$SECURED_OPERATION_COUNT"
+                  } >> "$EVIDENCE_DIR/metadata.txt"
+
+                  echo "OpenAPI paths: $PATH_COUNT"
+                  echo "OpenAPI operations: $OPERATION_COUNT"
+                  echo "OpenAPI security schemes: $SECURITY_SCHEMES_COUNT"
+                  echo "OpenAPI secured operations: $SECURED_OPERATION_COUNT"
+
+            - name: Run OWASP ZAP Automation Framework
+              shell: bash
+              run: |
+                  set -Eeuo pipefail
+
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+
+                  # Prepara o diretório de evidências.
+                  mkdir -p "$EVIDENCE_DIR"
+                  chmod 0777 "$EVIDENCE_DIR"
+
+                  # Preserva o plano utilizado na execução.
+                  cp "$DAST_PLAN" "$EVIDENCE_DIR/dast.rules.yml"
+
+                  # Baixa a versão fixa do OWASP ZAP.
+                  docker pull "$ZAP_IMAGE" \
+                    2>&1 | tee "$EVIDENCE_DIR/zap-pull.log"
+
+                  # Registra a identidade exata da imagem utilizada.
+                  ZAP_IMAGE_ID=$(docker image inspect "$ZAP_IMAGE" \
+                    --format '{{.Id}}')
+
+                  ZAP_IMAGE_DIGEST=$(docker image inspect "$ZAP_IMAGE" \
+                    --format '{{json .RepoDigests}}')
+
+                  # Gera uma chave exclusiva para a API do ZAP.
+                  KEY=$(openssl rand -hex 32)
+
+                  # Inicializa o ZAP em modo daemon.
+                  docker run -d \
+                    --name dast-zap \
+                    --add-host=host.docker.internal:host-gateway \
+                    --publish 127.0.0.1:8080:8080 \
+                    --volume "$GITHUB_WORKSPACE:/zap/wrk:ro" \
+                    --volume "$EVIDENCE_DIR:/zap/out:rw" \
+                    "$ZAP_IMAGE" \
+                    zap.sh -daemon \
+                      -host 0.0.0.0 \
+                      -port 8080 \
+                      -config "api.key=$KEY" \
+                      -config "api.addrs.addr.name=.*" \
+                      -config "api.addrs.addr.regex=true"
+
+                  # Aguarda a inicialização da API do ZAP.
+                  ready=false
+
+                  for attempt in $(seq 1 90); do
+                    if curl -fsS --max-time 5 \
+                      -G "$ZAP_API_URL/JSON/core/view/version/" \
+                      --data-urlencode "apikey=$KEY" \
+                      -o "$EVIDENCE_DIR/zap-version.json"; then
+
+                      ready=true
+                      break
+                    fi
+
+                    sleep 2
+                  done
+
+                  if [ "$ready" != true ]; then
+                    echo "::error::O OWASP ZAP não iniciou corretamente."
+
+                    docker logs dast-zap --tail 100 \
+                      > "$EVIDENCE_DIR/zap-startup-error.log" 2>&1 || true
+
+                    exit 1
+                  fi
+
+                  ZAP_VERSION=$(jq -r '.version // "unknown"' \
+                    "$EVIDENCE_DIR/zap-version.json")
+
+                  echo "zap_version=$ZAP_VERSION" \
+                    >> "$EVIDENCE_DIR/metadata.txt"
+
+                  # Confirma a versão principal esperada.
+                  if [ "$ZAP_VERSION" != "2.17.0" ]; then
+                    echo "::error::Versão inesperada do OWASP ZAP: $ZAP_VERSION."
+                    exit 1
+                  fi
+
+                  # Executa o plano nativo do Automation Framework.
+                  curl -fsS -G \
+                    "$ZAP_API_URL/JSON/automation/action/runPlan/" \
+                    --data-urlencode "apikey=$KEY" \
+                    --data-urlencode "filePath=/zap/wrk/$DAST_PLAN" \
+                    -o "$EVIDENCE_DIR/zap-plan-start.json"
+
+                  PLAN_ID=$(jq -r '.planId // empty' \
+                    "$EVIDENCE_DIR/zap-plan-start.json")
+
+                  if [ -z "$PLAN_ID" ]; then
+                    echo "::error::Não foi possível iniciar o plano de automação do ZAP."
+                    cat "$EVIDENCE_DIR/zap-plan-start.json"
+                    exit 1
+                  fi
+
+                  echo "zap_plan_id=$PLAN_ID" \
+                    >> "$EVIDENCE_DIR/metadata.txt"
+
+                  # Aguarda a conclusão do plano.
+                  completed=false
+
+                  for attempt in $(seq 1 900); do
+                    if curl -fsS -G \
+                      "$ZAP_API_URL/JSON/automation/view/planProgress/" \
+                      --data-urlencode "apikey=$KEY" \
+                      --data-urlencode "planId=$PLAN_ID" \
+                      -o "$EVIDENCE_DIR/zap-plan-progress.json"; then
+
+                      if jq -e '
+                        has("finished") and
+                        (.finished != null) and
+                        (.finished != "")
+                      ' "$EVIDENCE_DIR/zap-plan-progress.json" >/dev/null; then
+
+                        completed=true
+                        break
+                      fi
+                    fi
+
+                    sleep 2
+                  done
+
+                  if [ "$completed" != true ]; then
+                    echo "::error::Tempo limite da execução do plano ZAP."
+
+                    curl -fsS -G \
+                      "$ZAP_API_URL/JSON/automation/action/stopPlan/" \
+                      --data-urlencode "apikey=$KEY" \
+                      --data-urlencode "planId=$PLAN_ID" \
+                      -o "$EVIDENCE_DIR/zap-plan-stop.json" || true
+
+                    exit 1
+                  fi
+
+                  # Preserva os resultados do Automation Framework.
+                  PLAN_ERRORS=$(jq '(.error // []) | length' \
+                    "$EVIDENCE_DIR/zap-plan-progress.json")
+
+                  PLAN_WARNINGS=$(jq '(.warn // []) | length' \
+                    "$EVIDENCE_DIR/zap-plan-progress.json")
+
+                  jq -r '(.info // [])[]?' \
+                    "$EVIDENCE_DIR/zap-plan-progress.json" \
+                    > "$EVIDENCE_DIR/zap-plan-info.log"
+
+                  jq -r '(.warn // [])[]?' \
+                    "$EVIDENCE_DIR/zap-plan-progress.json" \
+                    > "$EVIDENCE_DIR/zap-plan-warnings.log"
+
+                  jq -r '(.error // [])[]?' \
+                    "$EVIDENCE_DIR/zap-plan-progress.json" \
+                    > "$EVIDENCE_DIR/zap-plan-errors.log"
+
+                  # Verifica os relatórios gerados pelos jobs nativos.
+                  REPORTS_OK=true
+
+                  if [ ! -s "$EVIDENCE_DIR/dast-report.json" ]; then
+                    REPORTS_OK=false
+                  fi
+
+                  if [ ! -s "$EVIDENCE_DIR/dast-report.html" ]; then
+                    REPORTS_OK=false
+                  fi
+
+                  if [ -s "$EVIDENCE_DIR/dast-report.json" ]; then
+                    jq -e . "$EVIDENCE_DIR/dast-report.json" \
+                      >/dev/null 2>&1 || REPORTS_OK=false
+                  fi
+
+                  # Preserva os metadados da execução.
+                  {
+                    echo "zap_image=$ZAP_IMAGE"
+                    echo "zap_image_id=$ZAP_IMAGE_ID"
+                    echo "zap_image_digest=$ZAP_IMAGE_DIGEST"
+                    echo "zap_plan_completed=true"
+                    echo "zap_plan_errors=$PLAN_ERRORS"
+                    echo "zap_plan_warnings=$PLAN_WARNINGS"
+                    echo "zap_reports_generated=$REPORTS_OK"
+                  } >> "$EVIDENCE_DIR/metadata.txt"
+
+                  # Erros tornam a execução inválida.
+                  if [ "$PLAN_ERRORS" -gt 0 ]; then
+                    echo "::error::O plano ZAP apresentou erros."
+                    exit 1
+                  fi
+
+                  # Avisos são preservados para análise.
+                  if [ "$PLAN_WARNINGS" -gt 0 ]; then
+                    echo "::warning::O plano ZAP apresentou avisos. Consulte zap-plan-warnings.log."
+                  fi
+
+                  # Ausência ou corrupção dos relatórios invalida a execução.
+                  if [ "$REPORTS_OK" != true ]; then
+                    echo "::error::Os relatórios DAST não foram gerados corretamente."
+                    exit 1
+                  fi
+
+                  # Calcula o hash do relatório original.
+                  sha256sum "$EVIDENCE_DIR/dast-report.json" \
+                    > "$EVIDENCE_DIR/dast-report-sha256.txt"
+
+            - name: Preserve DAST configuration and metadata
+              if: always()
+              shell: bash
+              run: |
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+
+                  mkdir -p "$EVIDENCE_DIR"
+
+                  {
+                    echo "runner_os=$RUNNER_OS"
+                    echo "runner_arch=$RUNNER_ARCH"
+                    echo "docker_version=$(docker --version 2>&1)"
+
+                    docker image inspect "$ZAP_IMAGE" \
+                      --format 'zap_image_id={{.Id}}' \
+                      2>/dev/null || true
+
+                    docker image inspect "$ZAP_IMAGE" \
+                      --format 'zap_image_digest={{json .RepoDigests}}' \
+                      2>/dev/null || true
+                  } >> "$EVIDENCE_DIR/metadata.txt"
+
+                  if [ -f "$DAST_PLAN" ]; then
+                    cp "$DAST_PLAN" "$EVIDENCE_DIR/dast.rules.yml"
+                  fi
+
+                  if [ -f "$EVIDENCE_DIR/dast-report.json" ]; then
+                    sha256sum "$EVIDENCE_DIR/dast-report.json" \
+                      > "$EVIDENCE_DIR/dast-report-sha256.txt"
+                  fi
+
+            - name: Collect DAST evidence
+              if: always()
+              shell: bash
+              run: |
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+
+                  mkdir -p "$EVIDENCE_DIR"
+
+                  docker logs dast-api \
+                    > "$EVIDENCE_DIR/application.log" 2>&1 || true
+
+                  docker logs dast-zap \
+                    > "$EVIDENCE_DIR/zap.log" 2>&1 || true
+
+                  docker rm -f dast-zap dast-api \
+                    >/dev/null 2>&1 || true
+
+                  docker image rm "$DAST_IMAGE" \
+                    >/dev/null 2>&1 || true
+
+            - name: Sanitize ZAP API key
+              if: always()
+              shell: bash
+              run: |
+                  # Remove a chave temporária da API do ZAP antes de enviar as evidências.
+                  if [ -f "$EVIDENCE_DIR/zap.log" ]; then
+                    sed -E -i \
+                      's/(Setting config api\.key = )[[:xdigit:]]+/\1[REDACTED]/g' \
+                      "$EVIDENCE_DIR/zap.log"
+                  fi
+
+            - name: Upload DAST evidence
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: dast-evidence-${{ inputs.experiment_group }}
+                  path: evidence/dast/
+                  if-no-files-found: warn
+                  retention-days: 90
+
+    # 5. Artefato Final de Análise SAST, DAST e SCA
+    analysis:
+        name: Consolidated Security Analysis
+        runs-on: ubuntu-24.04
+        needs: [validate, sast, sca, dast]
+        if: ${{ always() }}
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Download security evidence
+              uses: actions/download-artifact@v4
+              with:
+                  pattern: '*-evidence-*'
+                  path: collected
+                  merge-multiple: true
+
+            - name: Inspect downloaded evidence
+              shell: bash
+              run: |
+                  echo "Arquivos recebidos dos artefatos:"
+                  if [ -d collected ]; then
+                    find collected -type f -print | sort
+                  else
+                    echo "::warning::Diretório collected não foi criado."
+                  fi
+
+            - name: Generate consolidated analysis report
+              shell: bash
+              env:
+                  EXPERIMENT_GROUP: ${{ inputs.experiment_group }}
+                  VALIDATE_STATUS: ${{ needs.validate.result }}
+                  SAST_STATUS: ${{ needs.sast.result }}
+                  SCA_STATUS: ${{ needs.sca.result }}
+                  DAST_STATUS: ${{ needs.dast.result }}
+              run: |
+                  set -euo pipefail
+
+                  mkdir -p analysis/reports
+                  REPORTS="analysis/reports"
+                  OUTPUT="analysis/analysis.md"
+
+                  copy_report() {
+                    local source="$1"
+                    local target="$2"
+
+                    if [ -n "$source" ] && [ -s "$source" ] &&
+                      jq -e 'type == "object"' "$source" >/dev/null 2>&1; then
+                      cp "$source" "$REPORTS/$target"
+                      echo "Incluído: $target"
+                    else
+                      echo "::warning::Relatório ausente ou inválido: $source"
+                    fi
+                  }
+
+                  find_report() {
+                    local filename="$1"
+                    find collected -type f -name "$filename" -print -quit 2>/dev/null || true
+                  }
+
+                  copy_report "$(find_report semgrep-report.json)" sast-report.json
+                  copy_report "$(find_report npm-audit-all.json)" sca-all-report.json
+                  copy_report "$(find_report npm-audit-production.json)" sca-production-report.json
+                  copy_report "$(find_report dast-report.json)" dast-report.json
+
+                  {
+                    echo "# Relatório consolidado de segurança"
+                    echo
+                    echo "## Identificação da execução"
+                    echo
+                    echo "- Repositório: \`$GITHUB_REPOSITORY\`"
+                    echo "- Execução: \`$GITHUB_RUN_ID\`"
+                    echo "- Tentativa: \`$GITHUB_RUN_ATTEMPT\`"
+                    echo "- Commit: \`$GITHUB_SHA\`"
+                    echo "- Grupo experimental: \`$EXPERIMENT_GROUP\`"
+                    echo "- Data UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
+                    echo
+                    echo "## Estado dos jobs"
+                    echo
+                    echo "| Etapa | Resultado do GitHub Actions |"
+                    echo "|---|---|"
+                    echo "| Validação | $VALIDATE_STATUS |"
+                    echo "| SAST | $SAST_STATUS |"
+                    echo "| SCA | $SCA_STATUS |"
+                    echo "| DAST | $DAST_STATUS |"
+                    echo
+
+                    echo "## SAST — Semgrep"
+                    echo
+
+                    if [ -s "$REPORTS/sast-report.json" ]; then
+                      jq -r '
+                        "| Métrica | Quantidade |",
+                        "|---|---:|",
+                        "| Achados reportados | \((.results // []) | length) |",
+                        "| Erros reportados pela ferramenta | \((.errors // []) | length) |",
+                        "",
+                        "| Severidade original | Quantidade |",
+                        "|---|---:|",
+                        (
+                          [.results[]?.extra.severity // "UNKNOWN"]
+                          | sort
+                          | group_by(.)
+                          | .[]
+                          | "| \(.[0]) | \(length) |"
+                        )
+                      ' "$REPORTS/sast-report.json"
+                    else
+                      echo "Relatório SAST ausente ou inválido; não foi possível determinar os totais."
+                    fi
+
+                    echo
+                    echo "## SCA — npm audit"
+                    echo
+
+                    for file in sca-all-report.json sca-production-report.json; do
+                      echo "### $file"
+                      echo
+
+                      if [ -s "$REPORTS/$file" ] &&
+                        jq -e '.metadata.vulnerabilities | type == "object"' \
+                          "$REPORTS/$file" >/dev/null 2>&1; then
+
+                        if [ "$file" = "sca-production-report.json" ]; then
+                          jq -r '
+                            "| Severidade original | Quantidade |",
+                            "|---|---:|",
+                            "| Critical | \(.metadata.vulnerabilities.critical // 0) |",
+                            "| High | \(.metadata.vulnerabilities.high // 0) |",
+                            "| Moderate | \(.metadata.vulnerabilities.moderate // 0) |",
+                            "| Low | \(.metadata.vulnerabilities.low // 0) |",
+                            "| Info | \(.metadata.vulnerabilities.info // 0) |",
+                            "| Total reportado | \(.metadata.vulnerabilities.total // 0) |",
+                            "",
+                            "Dependências de produção analisadas: \(.metadata.dependencies.prod // 0)"
+                          ' "$REPORTS/$file"
+                        else
+                          jq -r '
+                            "| Severidade original | Quantidade |",
+                            "|---|---:|",
+                            "| Critical | \(.metadata.vulnerabilities.critical // 0) |",
+                            "| High | \(.metadata.vulnerabilities.high // 0) |",
+                            "| Moderate | \(.metadata.vulnerabilities.moderate // 0) |",
+                            "| Low | \(.metadata.vulnerabilities.low // 0) |",
+                            "| Info | \(.metadata.vulnerabilities.info // 0) |",
+                            "| Total reportado | \(.metadata.vulnerabilities.total // 0) |",
+                            "",
+                            "Dependências analisadas: \(.metadata.dependencies.total // 0)"
+                          ' "$REPORTS/$file"
+                        fi
+                      else
+                        echo "Relatório ausente ou sem estrutura válida de vulnerabilidades."
+                      fi
+
+                      echo
+                    done
+
+                    echo "## DAST — OWASP ZAP"
+                    echo
+
+                    if [ -s "$REPORTS/dast-report.json" ]; then
+                      jq -r '
+                        [
+                          .site[]?.alerts[]? as $alert
+                          | ($alert.instances // [])[]
+                          | (
+                              if (($alert.riskcode // "" | tostring) == "3") then "High"
+                              elif (($alert.riskcode // "" | tostring) == "2") then "Medium"
+                              elif (($alert.riskcode // "" | tostring) == "1") then "Low"
+                              elif (($alert.riskcode // "" | tostring) == "0") then "Informational"
+                              else "Unknown"
+                              end
+                            )
+                        ] as $severities |
+
+                        "| Severidade | Quantidade de ocorrências |",
+                        "|---|---:|",
+                        (
+                          ["High", "Medium", "Low", "Informational", "Unknown"][] as $severity |
+                          "| \($severity) | \([$severities[] | select(. == $severity)] | length) |"
+                        ),
+                        "| **Total** | **\($severities | length)** |"
+                      ' "$REPORTS/dast-report.json"
+                    else
+                      echo "Relatório DAST não encontrado."
+                    fi
+
+                    echo
+                    echo "## Limitações e interpretação"
+                    echo
+                    echo "- Os resultados representam achados reportados pelas ferramentas, não vulnerabilidades confirmadas individualmente."
+                    echo "- As severidades são mantidas conforme a classificação original de cada ferramenta."
+                    echo "- No SAST, os achados são contabilizados conforme os resultados presentes no JSON do Semgrep."
+                    echo "- No SCA, os totais são os reportados pelo npm audit. Os relatórios de todas as dependências e de produção possuem escopos distintos e não devem ser somados."
+                    echo "- No DAST, a tabela de severidade considera as ocorrências individuais presentes nas instâncias do relatório JSON original do ZAP."
+                    echo "- A varredura DAST não comprova, por si só, a cobertura de operações autenticadas ou de autorização entre usuários."
+                    echo "- A ausência de um relatório não significa ausência de vulnerabilidades."
+                    echo "- A existência de um relatório, isoladamente, não comprova que a análise foi concluída com sucesso."
+                    echo "- Os relatórios JSON originais são preservados para auditoria."
+                    echo "- Os totais de SAST, SCA e DAST não devem ser somados automaticamente."
+                    echo
+
+                    echo "## Relatórios JSON incluídos"
+                    echo
+
+                    found=false
+                    for file in "$REPORTS"/*.json; do
+                      [ -f "$file" ] || continue
+                      echo "- \`$(basename "$file")\`"
+                      found=true
+                    done
+
+                    if [ "$found" = false ]; then
+                      echo "Nenhum relatório JSON válido foi encontrado."
+                    fi
+                  } > "$OUTPUT"
+
+                  cat "$OUTPUT"
+
+            - name: Upload consolidated analysis
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: analysis-evidence
+                  path: |
+                      analysis/analysis.md
+                      analysis/reports/*.json
+                  if-no-files-found: warn
+                  retention-days: 90
