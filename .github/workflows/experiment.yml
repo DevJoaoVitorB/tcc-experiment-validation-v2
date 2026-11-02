@@ -146,7 +146,7 @@ jobs:
                       --config p/nodejs \
                       --config p/jwt \
                       --exclude .github/ \
-                      --exclude evidence/
+                      --exclude evidence/ \
                       --json \
                       --output /reports/semgrep-report.json \
                       /src \
@@ -464,6 +464,25 @@ jobs:
                   echo "OpenAPI security schemes: $SECURITY_SCHEMES_COUNT"
                   echo "OpenAPI secured operations: $SECURED_OPERATION_COUNT"
 
+            - name: Inspect OpenAPI operationIds
+              shell: bash
+              run: |
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+
+                  jq -r '
+                    .paths | to_entries[] |
+                    .key as $path |
+                    .value | to_entries[] |
+                    select(
+                      .key == "get" or
+                      .key == "post" or
+                      .key == "put" or
+                      .key == "patch" or
+                      .key == "delete"
+                    ) |
+                    "\(.key | ascii_upcase) \($path) -> \(.value.operationId // "SEM operationId")"
+                  ' "$EVIDENCE_DIR/openapi.json"
+                
             # NOVO: prepara e valida a autenticação antes de iniciar o ZAP.
             - name: Prepare authenticated DAST session
               shell: bash
