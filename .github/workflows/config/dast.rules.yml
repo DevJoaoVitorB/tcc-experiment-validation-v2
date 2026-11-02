@@ -1,0 +1,102 @@
+# OWASP ZAP Automation Framework
+# Plano DAST compartilhado pelos grupos A e B.
+#
+# Estratégia:
+# 1. Importar operações documentadas no OpenAPI.
+# 2. Explorar recursos adicionais por meio do Spider.
+# 3. Utilizar o token de acesso preparado pelo pipeline nas requisições do ZAP.
+# 4. Executar análise passiva e ativa sobre o contexto descoberto.
+# 5. Gerar relatórios JSON e HTML.
+#
+# A autenticação é preparada externamente pelo script
+# .github/workflows/config/scripts/prepare-dast-auth.mjs.
+# O token é fornecido ao container do ZAP por variáveis de ambiente,
+# antes da inicialização do ZAP. Nenhum token ou credencial é armazenado
+# neste arquivo.
+
+env:
+    contexts:
+        - name: authentication-api
+          urls:
+              - http://host.docker.internal:3000
+          includePaths:
+              - 'http://host\.docker\.internal:3000/.*'
+          authentication:
+              # Método manual: o pipeline prepara e fornece o cabeçalho.
+              method: manual
+              parameters: {}
+
+jobs:
+    # Importa as operações documentadas pela própria API.
+    - type: openapi
+      parameters:
+          apiUrl: http://host.docker.internal:3000/openapi.json
+          context: authentication-api
+          targetUrl: http://host.docker.internal:3000
+
+    # Explora recursos adicionais acessíveis a partir da raiz da API.
+    - type: spider
+      parameters:
+          context: authentication-api
+          url: http://host.docker.internal:3000
+          maxDuration: 2
+          maxDepth: 5
+          threadCount: 2
+
+    # Configura a análise passiva.
+    - type: passiveScan-config
+      parameters:
+          maxAlertsPerRule: 0
+          scanOnlyInScope: true
+          maxBodySizeInBytesToScan: 0
+
+    # Aguarda o processamento passivo das requisições importadas
+    # e das requisições geradas pelo Spider.
+    - type: passiveScan-wait
+      parameters:
+          maxDuration: 5
+
+    # Configura os limites da análise ativa.
+    - type: activeScan-config
+      parameters:
+          maxScanDurationInMins: 15
+          maxRuleDurationInMins: 5
+          maxAlertsPerRule: 0
+          threadPerHost: 2
+
+    # Executa análise ativa sobre o contexto descoberto.
+    # O cabeçalho de autenticação é injetado pelo próprio ZAP.
+    - type: activeScan
+      parameters:
+          context: authentication-api
+          threadPerHost: 2
+          maxAlertsPerRule: 0
+      policyDefinition:
+          defaultStrength: Medium
+          defaultThreshold: Medium
+
+    # Aguarda o processamento passivo das requisições geradas
+    # durante a análise ativa.
+    - type: passiveScan-wait
+      parameters:
+          maxDuration: 5
+
+    # Gera o relatório original em JSON.
+    - type: report
+      parameters:
+          template: traditional-json
+          reportDir: /zap/out
+          reportFile: dast-report.json
+          reportTitle: OWASP ZAP DAST Report
+          reportDescription: DAST da API de Autenticação
+          displayReport: false
+
+    # Gera o relatório em HTML.
+    - type: report
+      parameters:
+          template: traditional-html
+          reportDir: /zap/out
+          reportFile: dast-report.html
+          reportTitle: OWASP ZAP DAST Report
+          reportDescription: DAST da API de Autenticação
+          displayReport: false
