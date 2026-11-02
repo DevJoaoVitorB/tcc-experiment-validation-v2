@@ -25,23 +25,37 @@ Defina a modelagem de dados com base nos requisitos funcionais especificados, co
 
 Crie os arquivos de configuração e os componentes necessários para instalar, executar e testar a aplicação, incluindo os arquivos necessários para construir uma imagem Docker e executar a aplicação em um container.
 
+Documente no arquivo `README.md` os procedimentos necessários para instalação, configuração e execução da aplicação, incluindo os comandos utilizados e as instruções para execução por meio de container Docker.
+
+As instruções devem corresponder aos arquivos e procedimentos efetivamente disponibilizados no projeto.
+
 ## 6. Verificação
 
-Execute as verificações e os testes pertinentes ao funcionamento da aplicação, conforme as condições disponíveis, e corrija os erros funcionais identificados em relação aos requisitos especificados. Ao final, registre as verificações e os testes executados, seus respectivos resultados e aqueles que não puderam ser realizados, indicando os motivos.
+Execute as verificações e os testes pertinentes ao funcionamento da aplicação, conforme as condições disponíveis, e corrija os erros funcionais identificados em relação aos requisitos especificados.
+
+Documente no arquivo `README.md` as verificações e os testes efetivamente executados, seus respectivos comandos ou procedimentos e os resultados obtidos.
+
+Registre também os testes e verificações que não puderam ser realizados, indicando os motivos e as limitações encontradas.
+
+Os registros devem corresponder às atividades efetivamente realizadas e aos resultados observados, sem apresentar como executados testes ou verificações que não foram realizados.
 
 ## 7. Documentação da API
 
 A especificação OpenAPI deve representar fielmente a API implementada, contemplando todas as operações disponibilizadas, seus respectivos caminhos, métodos HTTP, parâmetros, dados de entrada, estruturas de resposta e códigos de status correspondentes.
 
-Cada operação deve possuir um identificador semântico (operationId) único e estável, que permita identificar sua finalidade independentemente do caminho HTTP utilizado.
+A especificação deve estar disponível por meio de uma rota HTTP no endereço `/openapi.json`, permitindo sua consulta automatizada pelos procedimentos de validação e análise da aplicação.
 
-Nas operações relacionadas aos requisitos funcionais, os identificadores devem permitir reconhecer semanticamente suas respectivas finalidades, sem exigir caminhos HTTP, métodos ou uma arquitetura específica.
+Cada operação deve possuir um identificador semântico (`operationId`) único e estável, que permita identificar sua finalidade independentemente do caminho HTTP utilizado.
+
+Nas operações relacionadas aos requisitos funcionais, os identificadores devem permitir reconhecer semanticamente suas respectivas finalidades, sem exigir caminhos HTTP ou métodos específicos.
 
 A documentação dos mecanismos de autenticação e das operações protegidas deve corresponder ao comportamento efetivamente implementado, incluindo as informações necessárias para identificar os mecanismos de autenticação e interpretar as estruturas de entrada e saída.
 
 A documentação deve permanecer consistente com o comportamento efetivamente implementado, sem omitir operações ou descrever funcionalidades inexistentes.
 
 A geração da especificação deve respeitar a liberdade de escolha da arquitetura, organização interna, nomenclatura e mecanismos de implementação, não sendo exigida a utilização de biblioteca ou estrutura específica.
+
+Registre no arquivo `README.md` o endereço de disponibilização da especificação OpenAPI e as informações necessárias para sua consulta.
 
 ## 8. Escopo
 
