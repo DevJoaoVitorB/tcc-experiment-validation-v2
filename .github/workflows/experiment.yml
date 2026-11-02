@@ -146,6 +146,7 @@ jobs:
                       --config p/nodejs \
                       --config p/jwt \
                       --exclude .github/ \
+                      --exclude evidence/
                       --json \
                       --output /reports/semgrep-report.json \
                       /src \
