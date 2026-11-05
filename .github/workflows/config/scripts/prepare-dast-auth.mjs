@@ -27,6 +27,10 @@ import { dirname, resolve } from 'node:path';
 
 const [openApiFile, baseUrlArgument, evidenceFile] = process.argv.slice(2);
 
+const HTTP_TRAFFIC = [];
+const KNOWN_SECRETS = new Set();
+let trafficFilePath;
+
 function fail(message) {
     throw new Error(message);
 }
@@ -496,36 +500,197 @@ function buildPayload(document, operationInfo, values, requiredSemantics) {
     return { mediaType: request.mediaType, payload };
 }
 
+function isSensitiveField(name) {
+    const normalized = normalizeName(name);
+    return (
+        normalized.includes('password') ||
+        normalized.includes('senha') ||
+        normalized === 'pass' ||
+        normalized === 'pwd' ||
+        normalized.includes('passphrase') ||
+        normalized.includes('token') ||
+        normalized.includes('secret') ||
+        normalized.includes('authorization') ||
+        normalized.includes('cookie') ||
+        normalized.includes('apikey') ||
+        normalized.includes('credential')
+    );
+}
+
+function sanitizeString(value) {
+    let sanitized = String(value);
+
+    for (const secret of KNOWN_SECRETS) {
+        if (secret) sanitized = sanitized.split(secret).join('[REDACTED]');
+    }
+
+    // Remove JWTs encontrados em textos não estruturados.
+    sanitized = sanitized.replace(
+        /\bBearer\s+[A-Za-z0-9._~-]+/gi,
+        'Bearer [REDACTED]',
+    );
+    sanitized = sanitized.replace(
+        /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+        '[REDACTED_JWT]',
+    );
+
+    return sanitized;
+}
+
+function sanitizeStructuredValue(value, fieldName = '') {
+    if (isSensitiveField(fieldName)) return '[REDACTED]';
+
+    if (Array.isArray(value)) {
+        return value.map((item) => sanitizeStructuredValue(item));
+    }
+
+    if (value && typeof value === 'object') {
+        return Object.fromEntries(
+            Object.entries(value).map(([key, child]) => [
+                key,
+                sanitizeStructuredValue(child, key),
+            ]),
+        );
+    }
+
+    return typeof value === 'string' ? sanitizeString(value) : value;
+}
+
+function sanitizeHeaders(headers) {
+    const result = {};
+
+    for (const [name, value] of Object.entries(headers)) {
+        result[name] = isSensitiveField(name)
+            ? '[REDACTED]'
+            : sanitizeString(value);
+    }
+
+    return result;
+}
+
+function corsHeaders(headers) {
+    return Object.fromEntries(
+        Object.entries(headers).filter(([name]) =>
+            /^(origin|access-control-)/i.test(name),
+        ),
+    );
+}
+
+function parseAndSanitizeBody(text) {
+    if (!text) return null;
+
+    try {
+        return {
+            format: 'json',
+            content: sanitizeStructuredValue(JSON.parse(text)),
+        };
+    } catch {
+        return {
+            format: 'text',
+            content: sanitizeString(text),
+        };
+    }
+}
+
+function persistHttpTraffic() {
+    if (!trafficFilePath) return;
+
+    writeFileSync(
+        trafficFilePath,
+        `${JSON.stringify(
+            {
+                format: 'authentication-http-traffic',
+                version: 1,
+                generated_at: new Date().toISOString(),
+                credentials_redacted: true,
+                exchanges: HTTP_TRAFFIC,
+            },
+            null,
+            2,
+        )}\n`,
+        { mode: 0o600 },
+    );
+}
+
 async function sendJsonRequest(
     url,
     method,
     payload,
     mediaType = 'application/json',
     headers = {},
+    label = 'authentication-request',
 ) {
-    const response = await fetch(url, {
+    const requestHeaders = {
+        Accept: 'application/json',
+        ...(payload === undefined ? {} : { 'Content-Type': mediaType }),
+        ...headers,
+    };
+    const requestBody =
+        payload === undefined ? undefined : JSON.stringify(payload);
+    const startedAt = new Date();
+    const started = Date.now();
+
+    const requestEvidence = {
+        label,
         method,
-        headers: {
-            Accept: 'application/json',
-            ...(payload === undefined ? {} : { 'Content-Type': mediaType }),
-            ...headers,
-        },
-        ...(payload === undefined ? {} : { body: JSON.stringify(payload) }),
-        signal: AbortSignal.timeout(15000),
-    });
+        url: url.toString(),
+        headers: sanitizeHeaders(requestHeaders),
+        cors_headers: corsHeaders(requestHeaders),
+        body:
+            requestBody === undefined
+                ? null
+                : parseAndSanitizeBody(requestBody),
+    };
 
-    let body = null;
-    const responseText = await response.text();
+    try {
+        const response = await fetch(url, {
+            method,
+            headers: requestHeaders,
+            ...(requestBody === undefined ? {} : { body: requestBody }),
+            signal: AbortSignal.timeout(15000),
+        });
 
-    if (responseText) {
-        try {
-            body = JSON.parse(responseText);
-        } catch {
-            body = null;
+        const responseText = await response.text();
+        let body = null;
+
+        if (responseText) {
+            try {
+                body = JSON.parse(responseText);
+            } catch {
+                body = null;
+            }
         }
-    }
 
-    return { response, body };
+        const responseHeaders = Object.fromEntries(response.headers.entries());
+
+        HTTP_TRAFFIC.push({
+            timestamp: startedAt.toISOString(),
+            duration_ms: Date.now() - started,
+            request: requestEvidence,
+            response: {
+                status: response.status,
+                status_text: response.statusText,
+                final_url: response.url,
+                redirected: response.redirected,
+                headers: sanitizeHeaders(responseHeaders),
+                cors_headers: corsHeaders(responseHeaders),
+                body: parseAndSanitizeBody(responseText),
+            },
+        });
+        persistHttpTraffic();
+
+        return { response, body };
+    } catch (error) {
+        HTTP_TRAFFIC.push({
+            timestamp: startedAt.toISOString(),
+            duration_ms: Date.now() - started,
+            request: requestEvidence,
+            response: null,
+            error: sanitizeString(error.message),
+        });
+        persistHttpTraffic();
+        throw error;
+    }
 }
 
 function findAccessToken(value) {
@@ -606,6 +771,13 @@ async function main() {
         );
     }
 
+    const resolvedEvidenceFile = resolve(evidenceFile);
+    mkdirSync(dirname(resolvedEvidenceFile), { recursive: true });
+    trafficFilePath = resolve(
+        dirname(resolvedEvidenceFile),
+        'authentication-http-traffic.json',
+    );
+
     const document = readJsonFile(resolve(openApiFile));
     const baseUrl = new URL(baseUrlArgument);
     const operations = enumerateOperations(document);
@@ -627,6 +799,8 @@ async function main() {
         password: `Dast!Aa1${randomBytes(18).toString('hex')}`,
     };
 
+    KNOWN_SECRETS.add(testUser.password);
+
     const registrationPayload = buildPayload(document, register, testUser, [
         'name',
         'email',
@@ -638,6 +812,8 @@ async function main() {
         register.method,
         registrationPayload.payload,
         registrationPayload.mediaType,
+        {},
+        'user-registration',
     );
     assertSuccessful(
         'Cadastro do usuário de teste',
@@ -654,6 +830,8 @@ async function main() {
         login.method,
         loginPayload.payload,
         loginPayload.mediaType,
+        {},
+        'user-login',
     );
     assertSuccessful('Autenticação do usuário de teste', loginResult.response);
 
@@ -665,6 +843,8 @@ async function main() {
         );
     }
 
+    KNOWN_SECRETS.add(accessToken);
+
     const profileUrl = getOperationUrl(document, profile, baseUrl);
     const profileResult = await sendJsonRequest(
         profileUrl,
@@ -672,6 +852,7 @@ async function main() {
         undefined,
         undefined,
         { Authorization: `Bearer ${accessToken}` },
+        'authenticated-profile',
     );
     assertSuccessful(
         'Validação do acesso autenticado ao perfil',
@@ -728,6 +909,8 @@ async function main() {
         zap_header_name: 'Authorization',
         zap_header_site: headerSite,
         secrets_written_to_evidence: false,
+        http_traffic_evidence: 'authentication-http-traffic.json',
+        http_exchanges_recorded: HTTP_TRAFFIC.length,
     };
 
     mkdirSync(dirname(resolve(evidenceFile)), { recursive: true });

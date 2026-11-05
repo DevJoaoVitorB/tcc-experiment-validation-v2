@@ -34,11 +34,13 @@ jobs:
           context: authentication-api
           targetUrl: http://host.docker.internal:3000
 
-    # Explora recursos adicionais acessíveis a partir da raiz da API.
+    # Usa a especificação OpenAPI, que é um recurso válido (HTTP 200),
+    # como ponto inicial para evitar a resposta 404 da raiz da API.
+    # A descoberta principal das rotas continua sendo feita pelo job openapi.
     - type: spider
       parameters:
           context: authentication-api
-          url: http://host.docker.internal:3000
+          url: http://host.docker.internal:3000/openapi.json
           maxDuration: 2
           maxDepth: 5
           threadCount: 2
@@ -80,6 +82,15 @@ jobs:
     - type: passiveScan-wait
       parameters:
           maxDuration: 5
+
+    # Exporta todas as mensagens HTTP geradas pelo ZAP durante a execução.
+    # Inclui requisições e respostas do Spider, OpenAPI e Active Scan.
+    - type: export
+      parameters:
+          context: authentication-api
+          type: har
+          source: all
+          fileName: /zap/out/dast-http-traffic.har
 
     # Gera o relatório original em JSON.
     - type: report
