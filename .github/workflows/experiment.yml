@@ -781,8 +781,7 @@ jobs:
                   docker image rm "$DAST_IMAGE" \
                     >/dev/null 2>&1 || true
 
-            # NOVO: remove o JWT e a chave da API dos logs antes do upload.
-            - name: Sanitize DAST credentials
+            - name: Sanitize DAST evidence
               if: always()
               shell: bash
               run: |
@@ -790,9 +789,9 @@ jobs:
 
                   EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
 
-                  # Sanitiza logs e HAR antes de publicar o artefato.
-                  # O cabeçalho Authorization permanece identificável,
-                  # mas seu valor (JWT) é substituído.
+                  # Recupera a propriedade dos arquivos criados pelo container ZAP.
+                  sudo chown -R "$(id -u):$(id -g)" "$EVIDENCE_DIR"
+
                   python3 - "$EVIDENCE_DIR" <<'PY'
                   import base64
                   import json
@@ -802,163 +801,133 @@ jobs:
                   from pathlib import Path
                   from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-                  evidence_dir = Path(sys.argv[1])
-                  token_value = os.environ.get("ZAP_AUTH_HEADER_VALUE", "")
+                  root = Path(sys.argv[1])
+                  token = os.environ.get("ZAP_AUTH_HEADER_VALUE", "")
 
-                  def clean_text(value):
-                      if not isinstance(value, str):
-                          return value
-
-                      if token_value:
-                          value = value.replace(token_value, "[REDACTED]")
-
-                      value = re.sub(
-                          r"(?i)Bearer\s+[A-Za-z0-9._~-]+",
-                          "Bearer [REDACTED]",
-                          value,
-                      )
-                      value = re.sub(
-                          r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
-                          "[REDACTED_JWT]",
-                          value,
-                      )
-                      return value
-
-                  def sensitive_name(name):
+                  def secret(name):
                       name = re.sub(r"[^a-z0-9]", "", str(name).lower())
-                      return (
-                          name == "pass" or
-                          name == "pwd" or
-                          any(term in name for term in (
+                      return name in ("pass", "pwd") or any(
+                          key in name for key in (
                               "authorization", "password", "senha", "passphrase",
                               "token", "secret", "cookie", "apikey", "credential"
-                          ))
+                          )
+                      )
+
+                  def clean(value):
+                      if not isinstance(value, str):
+                          return value
+                      if token:
+                          value = value.replace(token, "[REDACTED]")
+                      value = re.sub(r"(?i)Bearer\s+\S+", "Bearer [REDACTED]", value)
+                      return re.sub(
+                          r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+                          "[REDACTED_JWT]", value
                       )
 
                   def clean_json(value, key=""):
-                      if sensitive_name(key):
+                      if secret(key):
                           return "[REDACTED]"
-
                       if isinstance(value, dict):
-                          return {
-                              k: clean_json(v, k)
-                              for k, v in value.items()
-                          }
-
+                          return {k: clean_json(v, k) for k, v in value.items()}
                       if isinstance(value, list):
-                          return [clean_json(item) for item in value]
+                          return [clean_json(v) for v in value]
+                      return clean(value)
 
-                      return clean_text(value) if isinstance(value, str) else value
-
-                  def clean_body_text(value):
-                      if not isinstance(value, str):
-                          return value
+                  def clean_body(value):
                       try:
-                          parsed = json.loads(value)
                           return json.dumps(
-                              clean_json(parsed),
+                              clean_json(json.loads(value)),
                               ensure_ascii=False,
-                              separators=(",", ":"),
+                              separators=(",", ":")
                           )
-                      except (json.JSONDecodeError, TypeError):
-                          return clean_text(value)
+                      except (ValueError, TypeError):
+                          return clean(value)
 
-                  # Sanitiza os logs do container.
-                  for filename in ("application.log", "zap.log"):
-                      path = evidence_dir / filename
+                  def clean_message(message):
+                      for header in message.get("headers", []):
+                          name = header.get("name", "")
+                          header["value"] = (
+                              "[REDACTED]" if secret(name)
+                              else clean(header.get("value", ""))
+                          )
+
+                      for cookie in message.get("cookies", []):
+                          cookie["value"] = "[REDACTED]"
+
+                  # Logs da aplicação e do ZAP.
+                  for name in ("application.log", "zap.log"):
+                      path = root / name
                       if path.is_file():
-                          path.write_text(
-                              clean_text(path.read_text(
-                                  encoding="utf-8",
-                                  errors="replace",
-                              )),
-                              encoding="utf-8",
+                          content = clean(path.read_text(
+                              encoding="utf-8", errors="replace"
+                          ))
+                          content = re.sub(
+                              r"(Setting config api\.key = )[0-9a-fA-F]+",
+                              r"\1[REDACTED]", content
                           )
+                          path.write_text(content, encoding="utf-8")
 
-                  # Sanitiza as mensagens HTTP exportadas em HAR.
-                  har_path = evidence_dir / "dast-http-traffic.har"
-                  if har_path.is_file():
-                      har = json.loads(har_path.read_text(encoding="utf-8"))
+                  # Histórico HTTP HAR.
+                  path = root / "dast-http-traffic.har"
+                  if path.is_file():
+                      har = json.loads(path.read_text(encoding="utf-8"))
 
                       for entry in har.get("log", {}).get("entries", []):
                           request = entry.get("request", {})
                           response = entry.get("response", {})
 
-                          for message in (request, response):
-                              for header in message.get("headers", []):
-                                  name = header.get("name", "")
-                                  if sensitive_name(name):
-                                      header["value"] = "[REDACTED]"
-                                  elif "value" in header:
-                                      header["value"] = clean_text(header["value"])
+                          clean_message(request)
+                          clean_message(response)
 
-                              for cookie in message.get("cookies", []):
-                                  if "value" in cookie:
-                                      # Valores de cookies podem ser identificadores de sessão.
-                                      cookie["value"] = "[REDACTED]"
+                          for item in request.get("queryString", []):
+                              if secret(item.get("name", "")):
+                                  item["value"] = "[REDACTED]"
+                              else:
+                                  item["value"] = clean(item.get("value", ""))
 
-                          for parameter in request.get("queryString", []):
-                              if sensitive_name(parameter.get("name", "")):
-                                  parameter["value"] = "[REDACTED]"
-                              elif "value" in parameter:
-                                  parameter["value"] = clean_text(parameter["value"])
+                          post = request.get("postData", {})
+                          for item in post.get("params", []):
+                              if secret(item.get("name", "")):
+                                  item["value"] = "[REDACTED]"
+                              else:
+                                  item["value"] = clean(item.get("value", ""))
 
-                          post_data = request.get("postData", {})
-                          for parameter in post_data.get("params", []):
-                              if sensitive_name(parameter.get("name", "")):
-                                  parameter["value"] = "[REDACTED]"
-                              elif "value" in parameter:
-                                  parameter["value"] = clean_text(parameter["value"])
-
-                          if isinstance(post_data.get("text"), str):
-                              post_data["text"] = clean_body_text(post_data["text"])
+                          if isinstance(post.get("text"), str):
+                              post["text"] = clean_body(post["text"])
 
                           content = response.get("content", {})
-                          if isinstance(content.get("text"), str):
-                              body_text = content["text"]
+                          body = content.get("text")
+
+                          if isinstance(body, str):
                               if content.get("encoding") == "base64":
                                   try:
-                                      decoded = base64.b64decode(body_text).decode("utf-8")
-                                      cleaned = clean_body_text(decoded)
+                                      decoded = base64.b64decode(body).decode("utf-8")
                                       content["text"] = base64.b64encode(
-                                          cleaned.encode("utf-8")
+                                          clean_body(decoded).encode("utf-8")
                                       ).decode("ascii")
                                   except (ValueError, UnicodeDecodeError):
                                       pass
                               else:
-                                  content["text"] = clean_body_text(body_text)
+                                  content["text"] = clean_body(body)
 
-                          if "url" in request:
+                          if isinstance(request.get("url"), str):
                               parts = urlsplit(request["url"])
-                              query = []
-                              for name, value in parse_qsl(parts.query, keep_blank_values=True):
-                                  query.append((
-                                      name,
-                                      "[REDACTED]" if sensitive_name(name) else clean_text(value),
-                                  ))
+                              query = [
+                                  (key, "[REDACTED]" if secret(key) else clean(value))
+                                  for key, value in parse_qsl(
+                                      parts.query, keep_blank_values=True
+                                  )
+                              ]
                               request["url"] = urlunsplit((
-                                  parts.scheme,
-                                  parts.netloc,
-                                  parts.path,
-                                  urlencode(query),
-                                  parts.fragment,
+                                  parts.scheme, parts.netloc, parts.path,
+                                  urlencode(query), parts.fragment
                               ))
 
-                      har_path.write_text(
+                      path.write_text(
                           json.dumps(har, ensure_ascii=False, indent=2) + "\n",
-                          encoding="utf-8",
+                          encoding="utf-8"
                       )
 
-                  # Remove a chave temporária da API do ZAP dos logs.
-                  zap_log = evidence_dir / "zap.log"
-                  if zap_log.is_file():
-                      content = zap_log.read_text(encoding="utf-8", errors="replace")
-                      content = re.sub(
-                          r"(Setting config api\.key = )[0-9a-fA-F]+",
-                          r"\1[REDACTED]",
-                          content,
-                      )
-                      zap_log.write_text(content, encoding="utf-8")
                   PY
 
             - name: Upload DAST evidence
