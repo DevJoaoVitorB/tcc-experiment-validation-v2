@@ -693,6 +693,37 @@ async function sendJsonRequest(
     }
 }
 
+function inspectJwtTimeClaims(token) {
+    const parts = token.split('.');
+    if (parts.length !== 3) return { format: 'opaque' };
+
+    try {
+        const claims = JSON.parse(
+            Buffer.from(parts[1], 'base64url').toString('utf8'),
+        );
+        const now = Math.floor(Date.now() / 1000);
+        const issuedAt = Number.isFinite(claims.iat) ? claims.iat : null;
+        const expiresAt = Number.isFinite(claims.exp) ? claims.exp : null;
+
+        return {
+            format: 'jwt',
+            issued_at: issuedAt
+                ? new Date(issuedAt * 1000).toISOString()
+                : null,
+            expires_at: expiresAt
+                ? new Date(expiresAt * 1000).toISOString()
+                : null,
+            lifetime_seconds:
+                issuedAt !== null && expiresAt !== null
+                    ? expiresAt - issuedAt
+                    : null,
+            remaining_seconds: expiresAt !== null ? expiresAt - now : null,
+        };
+    } catch {
+        return { format: 'jwt-unreadable' };
+    }
+}
+
 function findAccessToken(value) {
     const priorities = new Map([
         ['accesstoken', 1],
@@ -844,8 +875,14 @@ async function main() {
     }
 
     KNOWN_SECRETS.add(accessToken);
+    const accessTokenTiming = inspectJwtTimeClaims(accessToken);
 
     const profileUrl = getOperationUrl(document, profile, baseUrl);
+    const zapBaseUrl = new URL(process.env.ZAP_BASE_URL || baseUrlArgument);
+    const zapProfileUrl = new URL(
+        `${profileUrl.pathname}${profileUrl.search}`,
+        zapBaseUrl,
+    ).toString();
     const profileResult = await sendJsonRequest(
         profileUrl,
         profile.method,
@@ -881,6 +918,7 @@ async function main() {
             `ZAP_AUTH_HEADER_VALUE=${headerValue}`,
             'ZAP_AUTH_HEADER=Authorization',
             `ZAP_AUTH_HEADER_SITE=${headerSite}`,
+            `DAST_ZAP_PROFILE_URL=${zapProfileUrl}`,
             '',
         ].join('\n'),
     );
@@ -901,6 +939,8 @@ async function main() {
         ),
         user_login: operationEvidence(login, loginResult.response),
         access_token_extracted: true,
+        access_token_timing: accessTokenTiming,
+        zap_profile_preflight_url: zapProfileUrl,
         authenticated_profile_request: operationEvidence(
             profile,
             profileResult.response,

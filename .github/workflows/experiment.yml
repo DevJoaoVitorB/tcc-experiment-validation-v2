@@ -483,7 +483,15 @@ jobs:
                     "\(.key | ascii_upcase) \($path) -> \(.value.operationId // "SEM operationId")"
                   ' "$EVIDENCE_DIR/openapi.json"
 
-            # NOVO: prepara e valida a autenticação antes de iniciar o ZAP.
+            # Baixa a imagem antes de gerar o token para reduzir o tempo de espera.
+            - name: Pull OWASP ZAP image
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  EVIDENCE_DIR="$GITHUB_WORKSPACE/$EVIDENCE_DIR"
+                  docker pull "$ZAP_IMAGE" \
+                    2>&1 | tee "$EVIDENCE_DIR/zap-pull.log"
+
             - name: Prepare authenticated DAST session
               shell: bash
               run: |
@@ -516,10 +524,6 @@ jobs:
 
                   # Preserva o plano utilizado na execução.
                   cp "$DAST_PLAN" "$EVIDENCE_DIR/dast.rules.yml"
-
-                  # Baixa a versão fixa do OWASP ZAP.
-                  docker pull "$ZAP_IMAGE" \
-                    2>&1 | tee "$EVIDENCE_DIR/zap-pull.log"
 
                   # Registra a identidade exata da imagem utilizada.
                   ZAP_IMAGE_ID=$(docker image inspect "$ZAP_IMAGE" \
@@ -572,6 +576,32 @@ jobs:
                     docker logs dast-zap --tail 100 \
                       > "$EVIDENCE_DIR/zap-startup-error.log" 2>&1 || true
 
+                    exit 1
+                  fi
+
+                  # Verifica a autenticação através do próprio proxy do ZAP.
+                  # O curl não envia Authorization: o cabeçalho deve ser injetado
+                  # pelas variáveis ZAP_AUTH_HEADER_* carregadas pelo processo.
+                  if [ -z "${DAST_ZAP_PROFILE_URL:-}" ]; then
+                    echo "::error::A URL dinâmica do perfil protegido não foi fornecida."
+                    exit 1
+                  fi
+
+                  if ! AUTH_PREFLIGHT_STATUS=$(curl --silent --show-error \
+                    --max-time 15 \
+                    --proxy http://127.0.0.1:8080 \
+                    --noproxy "" \
+                    --output /dev/null \
+                    --write-out '%{http_code}' \
+                    "$DAST_ZAP_PROFILE_URL"); then
+                    AUTH_PREFLIGHT_STATUS=000
+                  fi
+
+                  echo "zap_auth_preflight_status=$AUTH_PREFLIGHT_STATUS" \
+                    >> "$EVIDENCE_DIR/metadata.txt"
+
+                  if [ "$AUTH_PREFLIGHT_STATUS" != "200" ]; then
+                    echo "::error::O ZAP não conseguiu acessar a operação protegida antes do scan (HTTP $AUTH_PREFLIGHT_STATUS)."
                     exit 1
                   fi
 
@@ -641,6 +671,21 @@ jobs:
 
                     exit 1
                   fi
+
+                  # Verifica se a autenticação continua válida após a varredura.
+                  # A chamada também passa pelo proxy do ZAP, sem enviar o token pelo runner.
+                  if ! AUTH_POSTFLIGHT_STATUS=$(curl --silent --show-error \
+                    --max-time 15 \
+                    --proxy http://127.0.0.1:8080 \
+                    --noproxy "" \
+                    --output /dev/null \
+                    --write-out '%{http_code}' \
+                    "$DAST_ZAP_PROFILE_URL"); then
+                    AUTH_POSTFLIGHT_STATUS=000
+                  fi
+
+                  echo "zap_auth_postflight_status=$AUTH_POSTFLIGHT_STATUS" \
+                    >> "$EVIDENCE_DIR/metadata.txt"
 
                   # Preserva os resultados do Automation Framework.
                   PLAN_ERRORS=$(jq '(.error // []) | length' \
@@ -723,6 +768,13 @@ jobs:
                   # Ausência ou corrupção dos relatórios invalida a execução.
                   if [ "$REPORTS_OK" != true ]; then
                     echo "::error::Os relatórios DAST não foram gerados corretamente."
+                    exit 1
+                  fi
+
+                  # A execução só é considerada autenticada se o token permanecer
+                  # válido até o fim da varredura.
+                  if [ "$AUTH_POSTFLIGHT_STATUS" != "200" ]; then
+                    echo "::error::A autenticação do ZAP não permaneceu válida até o fim do scan (HTTP $AUTH_POSTFLIGHT_STATUS). Consulte o HAR e os metadados."
                     exit 1
                   fi
 
