@@ -3,8 +3,8 @@ name: Authentication API Experiment
 on:
     workflow_dispatch:
         inputs:
-            experiment_group:
-                description: 'Grupo do Experimento que Será Executado'
+            treatment:
+                description: 'Tratamento que Será Executado'
                 type: choice
                 options:
                     - A
@@ -12,19 +12,13 @@ on:
                 required: true
                 default: A
 
-            delete_temp_artifacts:
-                description: 'Excluir Artefatos Temporários Após Final da Análise'
-                type: boolean
-                required: true
-                default: true
-
 permissions:
     contents: read
 
 jobs:
     # 1. Validação da aplicação
     validate:
-        name: Validate - Grupo ${{ inputs.experiment_group }}
+        name: Validate - Tratamento ${{ inputs.treatment }}
         runs-on: ubuntu-24.04
 
         env:
@@ -48,7 +42,7 @@ jobs:
                   mkdir -p "$EVIDENCE_DIR"
 
                   {
-                    echo "experiment_group=${{ inputs.experiment_group }}"
+                    echo "treatment=${{ inputs.treatment }}"
                     echo "run_id=${GITHUB_RUN_ID}"
                     echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
                     echo "commit=${GITHUB_SHA}"
@@ -90,14 +84,14 @@ jobs:
               if: always()
               uses: actions/upload-artifact@v4
               with:
-                  name: validate-evidence-${{ inputs.experiment_group }}
+                  name: validate-evidence-${{ inputs.treatment }}
                   path: evidence/validate/
                   if-no-files-found: warn
                   retention-days: 14
 
     # 2. Análise Estática do Código-Fonte (SAST - Semgrep)
     sast:
-        name: SAST - Grupo ${{ inputs.experiment_group }}
+        name: SAST - Tratamento ${{ inputs.treatment }}
         runs-on: ubuntu-24.04
         needs: validate
 
@@ -116,7 +110,7 @@ jobs:
                   mkdir -p "$EVIDENCE_DIR"
 
                   {
-                    echo "experiment_group=${{ inputs.experiment_group }}"
+                    echo "treatment=${{ inputs.treatment }}"
                     echo "run_id=${GITHUB_RUN_ID}"
                     echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
                     echo "commit=${GITHUB_SHA}"
@@ -210,14 +204,14 @@ jobs:
               if: always()
               uses: actions/upload-artifact@v4
               with:
-                  name: sast-evidence-${{ inputs.experiment_group }}
+                  name: sast-evidence-${{ inputs.treatment }}
                   path: evidence/sast/
                   if-no-files-found: warn
                   retention-days: 90
 
     # 3. Análise de Dependências Diretas e Transitivas (SCA - npm audit)
     sca:
-        name: SCA - Grupo ${{ inputs.experiment_group }}
+        name: SCA - Tratamento ${{ inputs.treatment }}
         runs-on: ubuntu-24.04
         needs: validate
 
@@ -241,7 +235,7 @@ jobs:
                   mkdir -p "$EVIDENCE_DIR"
 
                   {
-                    echo "experiment_group=${{ inputs.experiment_group }}"
+                    echo "treatment=${{ inputs.treatment }}"
                     echo "run_id=${GITHUB_RUN_ID}"
                     echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
                     echo "commit=${GITHUB_SHA}"
@@ -303,14 +297,14 @@ jobs:
               if: always()
               uses: actions/upload-artifact@v4
               with:
-                  name: sca-evidence-${{ inputs.experiment_group }}
+                  name: sca-evidence-${{ inputs.treatment }}
                   path: evidence/sca/
                   if-no-files-found: warn
                   retention-days: 14
 
     # 4. Análise Dinâmica da Aplicação (DAST - OWASP ZAP)
     dast:
-        name: DAST - Grupo ${{ inputs.experiment_group }}
+        name: DAST - Tratamento ${{ inputs.treatment }}
         runs-on: ubuntu-24.04
         needs: validate
         timeout-minutes: 45
@@ -322,7 +316,7 @@ jobs:
             ZAP_BASE_URL: http://host.docker.internal:3000
             ZAP_API_URL: http://127.0.0.1:8080
             DAST_PLAN: .github/workflows/config/dast.rules.yml
-            DAST_IMAGE: authentication-api:dast-${{ inputs.experiment_group }}
+            DAST_IMAGE: authentication-api:dast-${{ inputs.treatment }}
             ZAP_IMAGE: zaproxy/zap-stable:2.17.0
             EVIDENCE_DIR: evidence/dast
 
@@ -339,7 +333,7 @@ jobs:
                   mkdir -p "$EVIDENCE_DIR"
 
                   {
-                    echo "experiment_group=${{ inputs.experiment_group }}"
+                    echo "treatment=${{ inputs.treatment }}"
                     echo "run_id=${GITHUB_RUN_ID}"
                     echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
                     echo "commit=${GITHUB_SHA}"
@@ -981,7 +975,7 @@ jobs:
               if: always()
               uses: actions/upload-artifact@v4
               with:
-                  name: dast-evidence-${{ inputs.experiment_group }}
+                  name: dast-evidence-${{ inputs.treatment }}
                   path: evidence/dast/
                   if-no-files-found: warn
                   retention-days: 90
@@ -1017,7 +1011,7 @@ jobs:
             - name: Generate consolidated analysis report
               shell: bash
               env:
-                  EXPERIMENT_GROUP: ${{ inputs.experiment_group }}
+                  TREATMENT: ${{ inputs.treatment }}
                   VALIDATE_STATUS: ${{ needs.validate.result }}
                   SAST_STATUS: ${{ needs.sast.result }}
                   SCA_STATUS: ${{ needs.sca.result }}
@@ -1061,7 +1055,7 @@ jobs:
                     echo "- Execução: \`$GITHUB_RUN_ID\`"
                     echo "- Tentativa: \`$GITHUB_RUN_ATTEMPT\`"
                     echo "- Commit: \`$GITHUB_SHA\`"
-                    echo "- Grupo experimental: \`$EXPERIMENT_GROUP\`"
+                    echo "- Tratamento experimental: \`$TREATMENT\`"
                     echo "- Data UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
                     echo
                     echo "## Estado dos jobs"
