@@ -982,7 +982,7 @@ jobs:
 
     # 5. Artefato Final de Análise SAST, DAST e SCA
     analysis:
-        name: Consolidated Security Analysis
+        name: Consolidated Security Analysis - Tratamento ${{ inputs.treatment }}
         runs-on: ubuntu-24.04
         needs: [validate, sast, sca, dast]
         if: ${{ always() }}
@@ -1204,7 +1204,7 @@ jobs:
               if: always()
               uses: actions/upload-artifact@v4
               with:
-                  name: analysis-evidence
+                  name: analysis-evidence-${{ inputs.treatment }}
                   path: |
                       analysis/analysis.md
                       analysis/reports/*.json
